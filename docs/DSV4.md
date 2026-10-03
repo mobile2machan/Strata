@@ -1,9 +1,11 @@
 # DeepSeek-V4-Flash: support plan
 
 Status: **P0 done** (2026-10-03, artifact inspection), **P1 done** (the real UD-IQ2_XXS pack is built -
-78.11 GiB of experts - and verified end to end) and **P2 load wiring done** (the geometry reader, the shape
-checks, and the native dense path all pass against the real artifact: `dsv4_layout_real` attaches 489 served
-matrices, 5.71 GiB). The engine can now read a deepseek4 pack's weights, but nothing computes a token yet.
+78.11 GiB of experts - and verified end to end) and **P2 loading done** (the geometry reader, the shape
+checks, the native dense path and the expert kernels all pass against the real artifact: `dsv4_layout_real`
+attaches 489 served matrices, 5.71 GiB, and accepts all 43 layers' expert pairs). The engine can now read
+every weight of a deepseek4 pack; what it cannot do yet is compute a token - none of the deepseek4 math
+exists.
 Everything marked *measured* below came from the artifact
 itself; speed figures are *estimates* with their reasoning stated, per the docs rule.
 
@@ -111,15 +113,22 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
    9,830,400 B/expert) and the raw integer types (the I32 `tid2eid`), and `NativeDense::eligible()` serves
    the deepseek4 projections. `dsv4_layout_real` then runs the real path end to end: `served_names` covers
    489 of the pack's 494 native rows - the five left out are exactly the three `tid2eid` tables and the
-   head/embedding (NativeHead's) - and `NativeDense::load` attaches all 489 (5.71 GiB). What is NOT served
-   natively and still blocks a run: the MXFP4 expert GEMV kernel (no Fmt<39> exists) and every piece of
-   deepseek4 math.
-  The new math, in order of risk: the Compressor (gated pooling + APE + ring state,
-  overlapping variant) and the tiered KV pool (window 128 + compressed entries + sinks); the indexer scoring
-  compressed entries (the QSA stack is the base); mHC Sinkhorn mixing (the GR plumbing is the base);
-  sqrtsoftplus router + `tid2eid` static routing; swiglu clamp; attention sinks; and an **MXFP4 expert
-  GEMV** - the UD-IQ2_XXS file puts MXFP4 in some layers' `down`, and no Strata kernel reads MXFP4 yet
-  (the block format is simple: 32 nibbles + one E8M0 scale).
+    head/embedding (NativeHead's) - and `NativeDense::load` attaches all 489 (5.71 GiB). *Expert kernels
+    done:* `STRATA_D_FMTS` gained IQ3_XXS and MXFP4 - the real file's three (gate/up, down) combinations are
+    (IQ2_XXS, IQ3_XXS) on 41 layers, (IQ2_XXS, MXFP4) and (IQ2_S, MXFP4) on two each, and a format missing
+    from the down list refused 41 of 43 layers. MXFP4's dot (`vec_dot_mxfp4_q8_1`) reads the e2m1 nibbles
+    through `get_int_from_table_16` and the DOUBLED `kvalues_mxfp4` table, so the dp4a chain is exact integer
+    arithmetic and the halving folds into the E8M0 scale (`2^(e-128)`, equal to ggml-cpu's
+    `GGML_E8M0_TO_FP32_HALF`); `dq_mxfp4` dequantizes bit-exact against ggml's `to_float`. The CPU oracle
+    needed nothing: the vendored ggml-cpu already has `ggml_vec_dot_mxfp4_q8_0`. Three new
+    `native_expert_parity` pairs cover the real combinations (the IQ3_XXS pair runs at FF=512 - its 256-block
+    does not divide the Qwen fixture's 640), and `dsv4_layout_real` asserts `native_expert_supported` for all
+    43 real layers. What still blocks a run: every piece of deepseek4 math.
+   The new math, in order of risk: the Compressor (gated pooling + APE + ring state,
+   overlapping variant) and the tiered KV pool (window 128 + compressed entries + sinks); the indexer scoring
+   compressed entries (the QSA stack is the base); mHC Sinkhorn mixing (the GR plumbing is the base);
+   sqrtsoftplus router + `tid2eid` static routing; swiglu clamp; attention sinks. (The MXFP4 expert GEMV
+   this list used to carry is done - see above.)
 - **P3 - around it.** Tokenizer pre-tokenizer `joyai-llm` + special tokens (the BPE core is already
   shared); chat template and the three thinking modes in `serve/`; a `dsv4` family in `setup.py` with the
   per-machine defaults above.

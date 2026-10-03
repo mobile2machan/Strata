@@ -32,6 +32,14 @@ __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
     x32 |= x16[2 * i32 + 1] << 16;
     return x32;
 }
+__device__ __forceinline__ int get_int_b1(const void* x, const int& i32) {
+    const uint8_t* x8 = (const uint8_t*) x;
+    int x32 = x8[4 * i32 + 0] << 0;
+    x32 |= x8[4 * i32 + 1] << 8;
+    x32 |= x8[4 * i32 + 2] << 16;
+    x32 |= x8[4 * i32 + 3] << 24;
+    return x32;
+}
 __device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return ((const int*) x)[i32]; }
 __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
@@ -473,6 +481,24 @@ __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq,
     return d8_0 * d8_1 * ((float) sumi);
 }
 
+// MXFP4 (deepseek4's native FP4 experts, docs/DSV4.md): 32 e2m1 nibbles + one E8M0 scale.  Byte j holds
+// element j in its low nibble and element j + 16 in its high nibble - the same split-half layout iq4_nl uses,
+// and what ggml-cpu's ggml_vec_dot_mxfp4_q8_0 (the parity oracle) reads.  kvalues_mxfp4 is the e2m1 table
+// DOUBLED (integers, so the dot is an exact dp4a chain); the halving folds into the scale:
+// d = 2^(e - 127) / 2 = 2^(e - 128), matching GGML_E8M0_TO_FP32_HALF and llama.cpp SYCL's e8m0 * 0.5f.
+__device__ __forceinline__ float vec_dot_mxfp4_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_mxfp4* bq4 = (const block_mxfp4*) vbq + kbx;
+    const int* q8 = (const int*) bq8_1->qs + iqs;
+    int sumi = 0;
+    const int aux_q4 = get_int_b1(bq4->qs, iqs);
+    const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+    sumi = ggml_cuda_dp4a(v.x, q8[0], sumi);
+    sumi = ggml_cuda_dp4a(v.y, q8[4], sumi);
+    const float d = ldexpf(1.0f, (int) bq4->e - 128) * __low2float(bq8_1->ds);
+    return d * sumi;
+}
+
 // ---------------------------------------------------------------- the formats
 // qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
 template<int TY> struct Fmt;
@@ -504,11 +530,13 @@ template<> struct Fmt<6> { static constexpr int qk = 32, ipb = QI5_0 / VDR_Q5_0,
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0, step = VDR_Q8_0;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<39> { static constexpr int qk = 32, ipb = 4, step = 1;   // MXFP4: one call per 4 qs bytes
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_mxfp4_q8_1(v, y, kbx, iqs); } };
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8)
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8)
+#define STRATA_D_FMTS(X) X(18) X(20) X(23) X(42) X(7) X(6) X(8) X(39)
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8)
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -1316,6 +1344,20 @@ __device__ void dq_bf16(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     for (int j = 0; j < 8; ++j) yy[tid * 8 + j] = cvt<dst_t>(__uint_as_float((uint32_t) x[j] << 16));
 }
 
+// MXFP4: 8 blocks per superblock, 4 threads per block, 8 values per thread (low nibble = element j, high = j+16).
+template<typename dst_t>
+__device__ void dq_mxfp4(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_mxfp4* x = (const block_mxfp4*) vx + ibs * 8;
+    const int ib = tid % 8, il = tid / 8;
+    const float d = ldexpf(1.0f, (int) x[ib].e - 128);
+    dst_t* y = yy + 32 * ib;
+    for (int j = 0; j < 4; ++j) {
+        const uint8_t byte = x[ib].qs[4 * il + j];
+        y[4 * il + j] = cvt<dst_t>((float) kvalues_mxfp4[byte & 0xF] * d);
+        y[16 + 4 * il + j] = cvt<dst_t>((float) kvalues_mxfp4[byte >> 4] * d);
+    }
+}
+
 // Every type below must also be in is_iq() (BF16: embed_type_supported): the host entry points refuse the others,
 // so the default is unreachable.
 template<typename dst_t>
@@ -1336,6 +1378,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 7: dq_q5_1(vx, ibs, y, tid); break;
         case 6: dq_q5_0(vx, ibs, y, tid); break;
         case 8: dq_q8_0(vx, ibs, y, tid); break;
+        case 39: dq_mxfp4(vx, ibs, y, tid); break;
         case 30: dq_bf16(vx, ibs, y, tid); break;
         default: break;
     }
@@ -1359,7 +1402,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
-           t == 12 || t == 13 || t == 7 || t == 6 || t == 8;
+           t == 12 || t == 13 || t == 7 || t == 6 || t == 8 || t == 39;
 }
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
@@ -1441,6 +1484,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
         case 6: return (size_t) (n / 32) * sizeof(block_q5_0);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
+        case 39: return (size_t) (n / 32) * sizeof(block_mxfp4);
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
         default: return 0;
     }

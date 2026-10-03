@@ -51,6 +51,9 @@ constexpr int64_t H = 2560, FF = 640;
 // The three ways and the dequantizers for one expert blob; returns the number of failed checks.
 int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
                cudaStream_t s) {
+    // the geometry follows f: a pair whose block size does not divide the Qwen fixture's FF (IQ3_XXS's 256
+    // does not divide 640) is built by the caller with its own FF, and everything here must follow it.
+    const int64_t H = f.n_embd, FF = f.n_ff;
     int failures = 0;
     // (a) the float reference
     const auto* tg = ggml_get_type_traits((ggml_type) f.gu_type);
@@ -401,9 +404,9 @@ std::vector<uint8_t> synthetic_blob(const cpu::NativeFmt& f, int seed) {
         ggml_quantize_chunk((ggml_type) type, w.data(), dst, 0, rows, cols,
                             ggml_quantize_requires_imatrix((ggml_type) type) ? imatrix.data() : nullptr);
     };
-    quant(f.gu_type, FF, H, blob.data());
-    quant(f.gu_type, FF, H, blob.data() + f.up_off);
-    quant(f.d_type, H, FF, blob.data() + f.down_off);
+    quant(f.gu_type, f.n_ff, f.n_embd, blob.data());
+    quant(f.gu_type, f.n_ff, f.n_embd, blob.data() + f.up_off);
+    quant(f.d_type, f.n_embd, f.n_ff, blob.data() + f.down_off);
     return blob;
 }
 
@@ -558,8 +561,11 @@ int main(int argc, char** argv) {
             const int dn = slash == std::string::npos ? -1 : type_of(arg.substr(slash + 1));
             cpu::NativeFmt f;
             std::string err;
-            if (gu < 0 || dn < 0 || !cpu::native_fmt(gu, dn, H, FF, f, err) ||
-                !strata::kernels::native_expert_supported(gu, dn, H, FF)) {
+            // A 256-block down format (IQ3_XXS, deepseek4's most common) does not divide the Qwen fixture's
+            // FF=640; the kernel check does not care which FF, so such a pair takes FF=512 instead.
+            const int64_t ff = FF % ggml_blck_size((ggml_type) (dn < 0 ? 0 : dn)) ? 512 : FF;
+            if (gu < 0 || dn < 0 || !cpu::native_fmt(gu, dn, H, ff, f, err) ||
+                !strata::kernels::native_expert_supported(gu, dn, H, ff)) {
                 std::printf("%s: %s\n", arg.c_str(), err.empty() ? "not a pair the GPU expert kernels take" : err.c_str());
                 ++failures;
                 continue;

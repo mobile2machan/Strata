@@ -17,6 +17,7 @@
 #include "strata/core/layout.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -331,6 +332,31 @@ int main(int argc, char** argv) {
                   "every served matrix carries a native pointer");
             std::printf("    served and attached: %zu matrices, %.2f GiB\n", attached,
                         (double)dense.weight_bytes() / 1073741824.0);
+
+            // P2.3: the expert admission gate.  Every real layer's (gate/up, down) pair must be one the
+            // GPU expert kernels take - including the two layers whose down is MXFP4, the format the
+            // UD-IQ2_XXS file introduced and no Strata kernel read before.
+            {
+                strata::GgufModel model(shards);
+                bool all_ok = true;
+                int mxfp4_layers = 0;
+                for (int l = 0; l < (int) g.n_layers; ++l) {
+                    size_t at = 0;
+                    const strata::TensorInfo* gt = model.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight", &at);
+                    const strata::TensorInfo* dt = model.find("blk." + std::to_string(l) + ".ffn_down_exps.weight", &at);
+                    if (!gt || !dt) { all_ok = false; std::printf("    layer %d: expert tensors not found\n", l); continue; }
+                    if (!strata::kernels::native_expert_supported((int) gt->type, (int) dt->type, g.n_embd, g.n_ff)) {
+                        all_ok = false;
+                        std::printf("    layer %d: gu=%s down=%s refused\n", l, strata::ggml_type_name(gt->type),
+                                    strata::ggml_type_name(dt->type));
+                    }
+                    if (dt->type == 39) ++mxfp4_layers;
+                }
+                check(all_ok, "native_expert_supported accepts every real layer's expert pair");
+                check(mxfp4_layers == 2, "the two MXFP4 down layers are among the accepted ones");
+                std::printf("    expert pairs accepted for all %d layers (%d with MXFP4 down)\n", (int) g.n_layers,
+                            mxfp4_layers);
+            }
         }
         std::printf(g_fail ? "dsv4_layout_test: %d FAILED\n" : "dsv4_layout_test: all passed\n", g_fail);
         return g_fail ? 1 : 0;
