@@ -40,12 +40,23 @@ struct Dsv4FfnWeights {
     const uint8_t* expert_blobs = nullptr;  ///< n_expert * experts.bytes, contiguous
 };
 
+/// The picks are known only after the router has run, and a whole layer's expert region
+/// (1.8 GiB) is far more than a step needs.  A caller that does not keep the region resident
+/// passes one of these instead of `expert_blobs`: the step calls `stage` once, after the picks
+/// are on the host, with the k ids; the source returns device memory holding exactly those k
+/// blobs, in pick order (blob `i` at `*out + i * bytes`).  Returning false fails the step.
+struct Dsv4ExpertSource {
+    virtual ~Dsv4ExpertSource() = default;
+    virtual bool stage(const int32_t* ids, int64_t n, int64_t bytes, const uint8_t** out) = 0;
+};
+
 /// Workspace bytes for one decode step of `layer`.
 int64_t dsv4_ffn_scratch_bytes(const ModelGeometry& g);
 
 /// One decode token through the FFN half.  `stream_in`/`stream_out` are [hc * n_embd] f32.
-void dsv4_ffn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnWeights& w,
+/// With `src` set the picked blobs come from it and `w.expert_blobs` may be null.
+bool dsv4_ffn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnWeights& w,
                           const float* stream_in, float* stream_out, int64_t token_id, float* scratch,
-                          void* cu_stream);
+                          void* cu_stream, Dsv4ExpertSource* src = nullptr);
 
 }  // namespace strata::core

@@ -20,10 +20,10 @@ int64_t dsv4_block_scratch_bytes(const ModelGeometry& g, int64_t layer, int64_t 
            align256(dsv4_ffn_scratch_bytes(g)) + align256(hc * g.n_embd * (int64_t) sizeof(float));
 }
 
-void dsv4_block_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4BlockWeights& w,
+bool dsv4_block_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4BlockWeights& w,
                             const Dsv4LayerState& st, const float* stream_in, float* stream_out,
                             int64_t pos, int64_t token_id, int64_t n_stage, float* scratch,
-                            void* cu_stream) {
+                            void* cu_stream, Dsv4ExpertSource* src) {
     const int64_t hc = g.hc;
     float* p = scratch;
     float* s_attn = p;
@@ -34,7 +34,7 @@ void dsv4_block_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Blo
                      // halves may not share the caller's buffers.
 
     dsv4_attn_decode_step(g, layer, w.attn, st, stream_in, mid, pos, n_stage, s_attn, cu_stream);
-    dsv4_ffn_decode_step(g, layer, w.ffn, mid, stream_out, token_id, s_ffn, cu_stream);
+    return dsv4_ffn_decode_step(g, layer, w.ffn, mid, stream_out, token_id, s_ffn, cu_stream, src);
 }
 
 }  // namespace strata::core

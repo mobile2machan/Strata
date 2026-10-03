@@ -46,6 +46,15 @@ public:
     const float* logits() const { return d_logits_; }
 
 private:
+    /// Stages exactly the picked experts: reads each id's blob from `experts.bin` into its own
+    /// pinned slot, then one H2D copy; the slots are contiguous, which is the pick order the
+    /// FFN half expects.
+    struct Stager : public Dsv4ExpertSource {
+        Dsv4Forward* f;
+        int64_t off = 0;  // the current layer's region start in experts.bin
+        explicit Stager(Dsv4Forward* ff) : f(ff) {}
+        bool stage(const int32_t* ids, int64_t n, int64_t bytes, const uint8_t** out) override;
+    };
     ModelGeometry g_;
     WeightTable* wt_ = nullptr;
     NativeEmbed embed_;
@@ -64,10 +73,11 @@ private:
     float* d_logits_ = nullptr;
     float* d_scratch_ = nullptr;
     std::FILE* experts_file_ = nullptr;
-    uint8_t* h_stage_ = nullptr;   // pinned host staging for one layer's expert region
-    uint8_t* d_blobs_ = nullptr;   // device copy of that region
-    std::vector<int64_t> layer_off_, layer_bytes_;
+    uint8_t* h_stage_ = nullptr;   // pinned host staging for the k picked blobs
+    uint8_t* d_blobs_ = nullptr;   // device copy of those blobs, pick order
+    std::vector<int64_t> layer_off_;
     std::vector<kernels::NativeExpertLayout> layer_layout_;
+    Stager stager_{this};
     void* stream_ = nullptr;
 };
 

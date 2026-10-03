@@ -28,9 +28,10 @@ int64_t dsv4_block_scratch_bytes(const ModelGeometry& g, int64_t layer, int64_t 
 /// One decode token through the whole block.  `stream_in`/`stream_out` are [hc * n_embd] f32 and
 /// must not alias each other (the block stages the hand-off itself); `pos` is the absolute
 /// position, `token_id` selects the hash row on a hash layer, `st` is the layer's pool state.
-void dsv4_block_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4BlockWeights& w,
+/// `src`, when set, supplies the picked expert blobs (see `Dsv4ExpertSource`).
+bool dsv4_block_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4BlockWeights& w,
                             const Dsv4LayerState& st, const float* stream_in, float* stream_out,
                             int64_t pos, int64_t token_id, int64_t n_stage, float* scratch,
-                            void* cu_stream);
+                            void* cu_stream, Dsv4ExpertSource* src = nullptr);
 
 }  // namespace strata::core

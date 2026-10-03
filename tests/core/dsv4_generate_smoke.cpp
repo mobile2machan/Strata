@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
     core::NativeDense dense;
     if (!dense.load(shards, wt, err, false)) { std::fprintf(stderr, "native dense: %s\n", err.c_str()); return 1; }
 
-    const std::vector<int64_t> prompt = {0, 151, 4023, 917};
+    const std::vector<int64_t> prompt = {0, 151, 4023, 917, 2046, 88, 12345, 60231};
     int failures = 0;
     std::vector<int64_t> sampled;
     core::Dsv4Forward fwd;

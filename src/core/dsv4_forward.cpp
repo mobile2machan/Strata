@@ -15,7 +15,7 @@ namespace strata::core {
 namespace {
 
 bool parse_layer_experts(const std::string& path, int64_t n_layers, int64_t n_expert, int64_t dim,
-                         int64_t ff, std::vector<int64_t>& off, std::vector<int64_t>& bytes,
+                         int64_t ff, std::vector<int64_t>& off, int64_t& max_blob,
                          std::vector<kernels::NativeExpertLayout>& lay, std::string& err) {
     std::ifstream f(path);
     if (!f) { err = "cannot open " + path; return false; }
@@ -34,6 +34,7 @@ bool parse_layer_experts(const std::string& path, int64_t n_layers, int64_t n_ex
         blob[(size_t) layer] = bl;
     }
     int64_t cur = 0;
+    max_blob = 0;
     for (int64_t l = 0; l < n_layers; ++l) {
         if (gu[(size_t) l] < 0) { err = "native_experts.txt has no row for layer " + std::to_string(l); return false; }
         const kernels::NativeExpertLayout nl = kernels::native_expert_layout(gu[(size_t) l], d[(size_t) l], dim, ff);
@@ -42,9 +43,9 @@ bool parse_layer_experts(const std::string& path, int64_t n_layers, int64_t n_ex
             return false;
         }
         off.push_back(cur);
-        bytes.push_back(blob[(size_t) l] * n_expert);
+        max_blob = std::max(max_blob, (int64_t) nl.bytes);
         lay.push_back(nl);
-        cur += bytes.back();
+        cur += blob[(size_t) l] * n_expert;
     }
     return true;
 }
@@ -86,18 +87,18 @@ bool Dsv4Forward::init(const ModelGeometry& g, const std::string& pack_dir,
     if (!resident("output_hc_scale.weight", hc_head_scale_)) return false;
     if (!resident("output_norm.weight", out_norm_)) return false;
 
+    int64_t max_blob = 0;
     if (!parse_layer_experts(pack_dir + "/native_experts.txt", g.n_layers, g.n_expert, g.n_embd,
-                             g.n_ff, layer_off_, layer_bytes_, layer_layout_, err))
+                             g.n_ff, layer_off_, max_blob, layer_layout_, err))
         return false;
     experts_file_ = std::fopen((pack_dir + "/experts.bin").c_str(), "rb");
     if (experts_file_ == nullptr) { err = "cannot open " + pack_dir + "/experts.bin"; return false; }
-    int64_t max_bytes = 0;
-    for (int64_t b : layer_bytes_) max_bytes = std::max(max_bytes, b);
-    h_stage_ = (uint8_t*) std::malloc((size_t) max_bytes);
+    const int64_t stage_bytes = max_blob * g.dsv4.n_expert_used;
+    h_stage_ = (uint8_t*) std::malloc((size_t) stage_bytes);
     if (h_stage_ == nullptr) { err = "staging malloc"; return false; }
-    if (cudaHostRegister(h_stage_, (size_t) max_bytes, cudaHostRegisterMapped) != cudaSuccess)
+    if (cudaHostRegister(h_stage_, (size_t) stage_bytes, cudaHostRegisterMapped) != cudaSuccess)
         (void) cudaGetLastError();  // pageable staging is legal, just slower
-    if (cudaMalloc((void**) &d_blobs_, (size_t) max_bytes) != cudaSuccess) { err = "cudaMalloc blobs"; return false; }
+    if (cudaMalloc((void**) &d_blobs_, (size_t) stage_bytes) != cudaSuccess) { err = "cudaMalloc blobs"; return false; }
 
     const int64_t dim = g.n_embd, hc = g.hc;
     cudaMalloc((void**) &d_a_, (size_t) hc * dim * 4);
@@ -137,25 +138,14 @@ bool Dsv4Forward::decode(int64_t token, int64_t pos, std::string& err) {
     float* out = d_b_;
     const int64_t n_stage = pos / 4 + 2;
     for (int64_t l = 0; l < g_.n_layers; ++l) {
-#ifdef _WIN32
-        if (_fseeki64(experts_file_, (__int64) layer_off_[(size_t) l], SEEK_SET) != 0) {
-#else
-        if (fseeko(experts_file_, (off_t) layer_off_[(size_t) l], SEEK_SET) != 0) {
-#endif
-            err = "seeking experts.bin at layer " + std::to_string(l);
-            return false;
-        }
-        if (std::fread(h_stage_, 1, (size_t) layer_bytes_[(size_t) l], experts_file_) !=
-            (size_t) layer_bytes_[(size_t) l]) {
-            err = "reading experts.bin at layer " + std::to_string(l);
-            return false;
-        }
-        cudaMemcpyAsync(d_blobs_, h_stage_, (size_t) layer_bytes_[(size_t) l], cudaMemcpyHostToDevice,
-                        (cudaStream_t) stream_);
+        stager_.off = layer_off_[(size_t) l];
         Dsv4BlockWeights w;
-        if (!resolver_.resolve(g_, *wt_, l, layer_layout_[(size_t) l], d_blobs_, w, err)) return false;
-        dsv4_block_decode_step(g_, l, w, state_.layer(l), in, out, pos, token, n_stage, d_scratch_,
-                               stream_);
+        if (!resolver_.resolve(g_, *wt_, l, layer_layout_[(size_t) l], nullptr, w, err)) return false;
+        if (!dsv4_block_decode_step(g_, l, w, state_.layer(l), in, out, pos, token, n_stage,
+                                    d_scratch_, stream_, &stager_)) {
+            err = "block step failed at layer " + std::to_string(l);
+            return false;
+        }
         std::swap(in, out);
         if (dbg) {
             const auto [bad, mx] = nonfinite(in, hc * dim);
@@ -171,6 +161,25 @@ bool Dsv4Forward::decode(int64_t token, int64_t pos, std::string& err) {
     if (dbg) std::printf("[dbg] y: max %.3e nonfinite %lld\n", (double) nonfinite(d_y_, dim).second, (long long) nonfinite(d_y_, dim).first);
     if (!head_.run(d_y_, d_logits_, stream_, err)) return false;
     if (dbg) std::printf("[dbg] logits nonfinite %lld\n", (long long) nonfinite(d_logits_, g_.dsv4.n_vocab).first);
+    return true;
+}
+
+bool Dsv4Forward::Stager::stage(const int32_t* ids, int64_t n, int64_t bytes, const uint8_t** out) {
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t at = off + (int64_t) ids[i] * bytes;
+#ifdef _WIN32
+        if (_fseeki64(f->experts_file_, (__int64) at, SEEK_SET) != 0) return false;
+#else
+        if (fseeko(f->experts_file_, (off_t) at, SEEK_SET) != 0) return false;
+#endif
+        if (std::fread(f->h_stage_ + (size_t) i * bytes, 1, (size_t) bytes, f->experts_file_) !=
+            (size_t) bytes)
+            return false;
+    }
+    cudaMemcpyAsync(f->d_blobs_, f->h_stage_, (size_t) n * bytes, cudaMemcpyHostToDevice,
+                    (cudaStream_t) f->stream_);
+    cudaStreamSynchronize((cudaStream_t) f->stream_);  // the slots are reused by the next call
+    *out = f->d_blobs_;
     return true;
 }
 

@@ -84,9 +84,9 @@ int64_t dsv4_ffn_scratch_bytes(const ModelGeometry& g) {
     return c.off;
 }
 
-void dsv4_ffn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnWeights& w,
+bool dsv4_ffn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnWeights& w,
                           const float* stream_in, float* stream_out, int64_t token_id, float* scratch,
-                          void* cu) {
+                          void* cu, Dsv4ExpertSource* src) {
     const int64_t hc = g.hc, dim = g.n_embd, ff = g.n_ff, k = g.dsv4.n_expert_used;
     const int64_t mix_hc = (2 + hc) * g.hc;
     const float eps = g.dsv4.norm_eps;
@@ -149,10 +149,18 @@ void dsv4_ffn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnWe
     peek("y2_shared", s.y2, dim);
 
     // ---- the routed experts: the pack's native blobs through iq_mmvq, q8_1 activations both
-    // sides, the same clamped SwiGLU, then the router's weights onto each down output.
+    // sides, the same clamped SwiGLU, then the router's weights onto each down output.  With a
+    // source the picked blobs were just staged (pick order); without one the caller already
+    // supplied the whole region and the ids index it directly.
     const float gu_limit = g.dsv4.swiglu_clamp_exp[(size_t) layer];
+    const uint8_t* base = w.expert_blobs;
+    bool staged = false;
+    if (src != nullptr) {
+        if (!src->stage(h_ids.data(), k, w.experts.bytes, &base)) return false;
+        staged = true;
+    }
     for (int64_t e = 0; e < k; ++e) {
-        const uint8_t* blob = w.expert_blobs + (int64_t) h_ids[(size_t) e] * w.experts.bytes;
+        const uint8_t* blob = base + (staged ? e : (int64_t) h_ids[(size_t) e]) * w.experts.bytes;
         kernels::iq_mmvq(w.experts.gu_type, blob, s.xq, s.gu, (int) dim, (int) ff, 1, cu);
         kernels::iq_mmvq(w.experts.gu_type, blob + w.experts.up_off, s.xq, s.gu + ff, (int) dim,
                          (int) ff, 1, cu);
@@ -169,6 +177,7 @@ void dsv4_ffn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnWe
     // ---- hc_post(ffn).
     kernels::hc_post_combine(s.y2, stream_in, s.post, s.comb, stream_out, 1, hc, dim, cu);
     peek("out", stream_out, hc * dim);
+    return true;
 }
 
 }  // namespace strata::core
