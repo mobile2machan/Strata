@@ -123,9 +123,17 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
     needed nothing: the vendored ggml-cpu already has `ggml_vec_dot_mxfp4_q8_0`. Three new
     `native_expert_parity` pairs cover the real combinations (the IQ3_XXS pair runs at FF=512 - its 256-block
     does not divide the Qwen fixture's 640), and `dsv4_layout_real` asserts `native_expert_supported` for all
-    43 real layers. What still blocks a run: every piece of deepseek4 math.
-   The new math, in order of risk: the Compressor (gated pooling + APE + ring state,
-   overlapping variant) and the tiered KV pool (window 128 + compressed entries + sinks); the indexer scoring
+     43 real layers. *Compressor math started:* `include/strata/kernels/compressor.hpp` + `
+     src/kernels/cuda/compressor.cu` pool a window by a softmax over the ROW axis per column (FreeToken's
+     `gated_pool`), with the r=4 overlap window = previous block's first-half columns + current block's
+     second half, the APE added at every carry write, and the register roll on completion - prefill, carry
+     seed and decode step. `compressor_parity` checks all three real shapes (r=4 d=512, r=128 d=512,
+     indexer r=4 d=128) against a float64 reference of `compress.py` (prefill rel ~7e-8, carry and decode
+     exact) and asserts the three wrong readings - row-axis softmax, swapped overlap halves, -inf rows
+     zeroed instead of masked - are observably apart. What still blocks a run: the pool addressing and
+     layer wiring around these kernels, and the rest of the math.
+   The new math, in order of risk: the tiered KV pool (window 128 + compressed entries + sinks) and the
+   layer wiring that drives the compressor kernels above; the indexer scoring
    compressed entries (the QSA stack is the base); mHC Sinkhorn mixing (the GR plumbing is the base);
    sqrtsoftplus router + `tid2eid` static routing; swiglu clamp; attention sinks. (The MXFP4 expert GEMV
    this list used to carry is done - see above.)

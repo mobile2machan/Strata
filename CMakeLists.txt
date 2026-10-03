@@ -262,8 +262,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
-                          src/kernels/cuda/iq_kernels.cu
-                          src/kernels/ngram.cpp
+                           src/kernels/cuda/iq_kernels.cu
+                           src/kernels/cuda/compressor.cu
+                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
@@ -661,6 +662,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(elementwise_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(elementwise_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME elementwise_parity COMMAND elementwise_parity --selftest)
+
+  add_executable(compressor_parity src/kernels/compressor_parity.cpp)
+  target_include_directories(compressor_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(compressor_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME compressor_parity COMMAND compressor_parity --selftest)
 
   add_executable(bf16_gemv_parity src/kernels/bf16_gemv_parity.cpp)
   target_include_directories(bf16_gemv_parity PRIVATE ${_strata_gpu_include_directories})
