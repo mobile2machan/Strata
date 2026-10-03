@@ -204,8 +204,20 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
       from the GPU kernels (they are parity-tested on their own), so what is under test is the
       wiring. Streams match at ~2e-7 (1e-4 at the token where a quantization boundary rounds
       differently), the three pools match, and no-sink / window-only / no-top-k come out 0.25-0.4
-      apart. What still blocks a run: the FFN half of the block (the router and expert path exist,
-      unwired), and the session/generate path around both.
+      apart. *FFN-half wiring done:* `core/dsv4_ffn.cpp` wires the other half of the block - mHC
+      pre(ffn), ffn_norm, the router (bf16 GEMV then `dsv4_router_score`, or `dsv4_router_hash` on
+      a hash layer), the shared expert (bf16 GEMVs + clamped SwiGLU), and the top-k routed experts
+      as the pack's own blobs: q8_1 activation, `iq_mmvq` over the `NativeExpertLayout` blob
+      (gate, up), clamped SwiGLU, q8_1 again, down, each scaled by its router weight - then mHC
+      post. `dsv4_ffn_layer_parity` runs a score-routed layer and a hash layer against a float64
+      transcription with the real artifact's expert pair (IQ2_XXS gate/up, IQ3_XXS down) at the
+      real 4096/2048, the blobs ggml-quantized and dequantized through the same kernels the expert
+      parity tests vouch for; streams match at ~3e-4 to 8e-4 (the q8_1 activation rounding feeds
+      on the engine's own fp32, which is the pipeline, not the wiring), and dropping the route
+      scale, gathering weights from the post-bias scores, or dropping the SwiGLU clamp come out
+      observably apart. One layout fact the test caught: the CUDA `block_q8_1` is `half2 ds
+      (d, sum) + qs[32]` - 36 bytes, not the CPU's 34. What still blocks a run: the session/
+      generate path that joins the two halves and feeds them the pack's weights.
     The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
     per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above.
     (The MXFP4 expert GEMV, the attention sinks, the mHC Sinkhorn mixing, the sqrtsoftplus/`tid2eid`
