@@ -145,7 +145,16 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
       the live block count so the top-k only sees real keys. `dsv4_indexer_parity` (real shape 64x128,
       staged and fully-live cases) matches the `indexer.py` equivalence at ~1e-7 and asserts no-relu,
       flat-weights and dropped-valid observably apart (the last only where the fixture can see it).
-      What still blocks a run: the pool buffers and layer wiring around
+      *Pool round-trips done:* `dsv4_quant.hpp/.cu` - the pools store plain bf16 whose VALUES sit on a
+      reduced grid, because `act_quant_fp8_inplace` / `fp4_act_quant_inplace` are quant+dequant round-trips
+      at a power-of-two scale (`s = 2**ceil(log2(amax/max))`, the reference's float bit-trick, floors
+      1e-4 / 6*2**-126): e4m3 at block 64 for window/compressed rows, e2m1 at block 32 for indexer q and
+      keys with the hardware tie table (0.75->1, 1.25->1, 1.75->2, 2.5->2, 3.5->4, 5.0->4); plus the
+      indexer's normalized Sylvester Hadamard (`WHT * d**-0.5`) that spreads the energy before the fp4
+      grid. `dsv4_quant_parity` asserts the round-trips BIT-EXACT against an enumerated e4m3 grid and the
+      `_round_fp4` chain (grid-times-pow2 values are exact in bf16, so any difference is real), checks the
+      tie points directly, and flags linear-scale and unnormalized-WHT. What still blocks a run: the pool
+      buffers and layer wiring around
       these kernels, and the rest of the math.
     The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
     per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above;
