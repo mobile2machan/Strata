@@ -138,11 +138,18 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
       (`act_quant_fp8_inplace` is a round-trip, so the pool stores e4m3-grid values in bf16 - packing them
       is a later memory win, not a correctness need). `dsv4_attn_parity` (full window+cmp, window-only, and
       sink-null cases) matches a float64 reference at ~3e-7 and asserts no-sink, -1-reads-row-0 and
-      dropped-scale observably apart. What still blocks a run: the pool buffers and layer wiring around
+      dropped-scale observably apart. *Indexer scoring done:* `dsv4_indexer.hpp/.cu` computes the
+      Lightning-Indexer logit per block - `sum_h relu(q_h . k_t) * weights[h]`, one shared compressed
+      key across the 64 index heads, the RELU part of the definition (anti-correlated heads drop out,
+      they do not cancel), the `softmax_scale * n_heads ** -0.5` fold living in `weights`, and -inf past
+      the live block count so the top-k only sees real keys. `dsv4_indexer_parity` (real shape 64x128,
+      staged and fully-live cases) matches the `indexer.py` equivalence at ~1e-7 and asserts no-relu,
+      flat-weights and dropped-valid observably apart (the last only where the fixture can see it).
+      What still blocks a run: the pool buffers and layer wiring around
       these kernels, and the rest of the math.
     The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
-    per-page carry state) and the layer wiring that drives the compressor and gather kernels above; the indexer scoring
-    compressed entries (the QSA stack is the base); mHC Sinkhorn mixing (the GR plumbing is the base);
+    per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above;
+    mHC Sinkhorn mixing (the GR plumbing is the base);
     sqrtsoftplus router + `tid2eid` static routing; swiglu clamp. (The MXFP4 expert GEMV and the
     attention sinks this list used to carry are done - see above.)
 - **P3 - around it.** Tokenizer pre-tokenizer `joyai-llm` + special tokens (the BPE core is already
