@@ -116,6 +116,9 @@ is faster, larger is a bit smarter.
 Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). You can add another model later with
 `SETUP.bat` (Linux: `./setup.sh --setup`).
 
+Not in the menu yet: a plan to run **DeepSeek-V4-Flash** the same way - the same expert streaming, a different
+model. Nothing to install yet: [docs/DSV4.md](docs/DSV4.md).
+
 ## Using it
 
 <p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
