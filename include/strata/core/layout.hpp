@@ -19,12 +19,18 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::core {
+
+/// Which model family a pack is.  The engine had exactly one (`qwen4exp`) until `deepseek4` (docs/DSV4.md);
+/// the reader that fills the geometry dispatches on `general.architecture`, and so does `check_layer`.
+enum class ModelArch : int { Qwen4Exp = 0, DeepSeek4 = 1 };
 
 /// The model's geometry, taken from `docs/semantics.md` and the artifact's own metadata.  Every field here
 /// is a number a kernel depends on, so a change is a change to a kernel contract and not a tuning knob.
 struct ModelGeometry {
+    ModelArch arch = ModelArch::Qwen4Exp;
     int64_t n_embd = 2560;
     int64_t n_layers = 48;
     int64_t qsa_interval = 4;      ///< every 4th layer is full attention: layers 3, 7, ... 47
@@ -52,6 +58,27 @@ struct ModelGeometry {
     int64_t n_expert = 512;
     int64_t n_ff = 640;
 
+    /// deepseek4 only (docs/DSV4.md).  The shared scalars above are reused as-is - for the measured
+    /// UD-IQ2_XXS artifact they read n_embd 4096, n_layers 43, n_head 64, n_head_kv 1, head_dim 512
+    /// (key_length = value_length), idx_q_heads 64, idx_key_dim 128, hc 4, n_expert 256, n_ff 2048 -
+    /// and the GDN/QSA fields are not read.  Everything here is a number the deepseek4 kernels will
+    /// depend on, measured from the artifact's own metadata, not guessed.
+    struct Dsv4 {
+        int64_t n_vocab = 0;           ///< from the tokenizer array; `ffn_gate_tid2eid` is [used, vocab]
+        int64_t q_lora = 1024;         ///< attn_q_a is [n_embd, q_lora], attn_q_b is [q_lora, heads*dim]
+        int64_t o_lora = 1024;         ///< attn_output_a is [n_embd, o_groups*o_lora]
+        int64_t o_groups = 8;
+        int64_t sliding_window = 128;  ///< the r=0 layers attend inside this and nothing else
+        int64_t idx_topk = 512;
+        int64_t n_expert_used = 6;
+        int64_t hash_layers = 3;       ///< layers 0..hash_layers-1 route through tid2eid instead of a router
+        int64_t sinkhorn_iters = 20;   ///< mHC mixing, `hyper_connection.sinkhorn_iterations`
+        /// Per layer: 0 = sliding window only; 4 = the OVERLAPPING compressor variant, and the only layers
+        /// that carry an indexer; 128 = the plain compressor.  Measured on the artifact: 2 + 21 + 20 = 43,
+        /// and the array itself is 46 entries long - the last three belong to no layer and are ignored.
+        std::vector<int64_t> compress_ratios;
+    } dsv4;
+
     int64_t hc_dim() const { return hc * n_embd; }
     /// `layer % qsa_interval == qsa_interval - 1` is full attention.  Derived, not a second list.
     int64_t n_qsa_layers() const { return n_layers / qsa_interval; }
@@ -63,6 +90,16 @@ struct ModelGeometry {
 inline bool is_qsa_layer(const ModelGeometry& g, int64_t layer) {
     return layer % g.qsa_interval == g.qsa_interval - 1;
 }
+
+/// deepseek4's per-layer attention class comes from the artifact's own `compress_ratios` array, not from an
+/// interval: the measured UD-IQ2_XXS artifact is 2 window layers, then 4 and 128 alternating.  A ratio of 4
+/// is the overlapping compressor variant and the only class that carries an indexer (measured: all 21 r=4
+/// layers have `indexer.*` and `indexer_compressor_*`; the 20 r=128 layers and the 2 r=0 layers have neither).
+inline int64_t dsv4_ratio(const ModelGeometry& g, int64_t layer) {
+    return layer < (int64_t) g.dsv4.compress_ratios.size() ? g.dsv4.compress_ratios[(size_t) layer] : -1;
+}
+inline bool dsv4_has_indexer(const ModelGeometry& g, int64_t layer) { return dsv4_ratio(g, layer) == 4; }
+inline bool dsv4_is_hash_layer(const ModelGeometry& g, int64_t layer) { return layer < g.dsv4.hash_layers; }
 
 /// One layer's tensors, resolved by NAME.  `get("attn_qkv.weight")` looks up `blk.<layer>.attn_qkv.weight`
 /// and returns null if the pack does not have it - a null is information, because a GDN layer has no

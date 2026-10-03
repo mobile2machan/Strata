@@ -91,7 +91,16 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
   a two-shard deepseek4 fixture (metadata-only shard 1, a hash layer beside a routed layer, IQ2_XXS/IQ3_XXS
   experts) and checks the arena is the source bytes relaid per expert. Remaining: build the real 91 GB pack
   and verify it end to end.
-- **P2 - engine.** The new math, in order of risk: the Compressor (gated pooling + APE + ring state,
+- **P2 - engine.** *First step done:* the geometry reader and the shape checks. `include/strata/artifact/
+  dsv4_geometry.hpp` fills a `ModelGeometry` (`arch = DeepSeek4`, a `Dsv4` block for the numbers Qwen does
+  not have) from the artifact's own `deepseek4.*` metadata, refusing a missing or implausible key by name;
+  `check_layer`/`check_all` in `src/core/layout.cpp` gained the deepseek4 tables - every shape measured from
+  the UD-IQ2_XXS tensor directory, including the two compressor widths (2x key for r=4, key for r=128), the
+  mHC widths (6*hc, hc-1), the per-class presence rules (indexer only on r=4 layers) and the hash layers'
+  `tid2eid` beside a missing `exp_probs_b`. `tests/core/dsv4_layout_test.cpp` reads a synthetic GGUF and
+  checks a synthetic pack covering all four fixture classes, plus the five named negatives. The engine still
+  refuses to LOAD a deepseek4 pack (`check_architecture` is untouched) - that wiring is the next step.
+  The new math, in order of risk: the Compressor (gated pooling + APE + ring state,
   overlapping variant) and the tiered KV pool (window 128 + compressed entries + sinks); the indexer scoring
   compressed entries (the QSA stack is the base); mHC Sinkhorn mixing (the GR plumbing is the base);
   sqrtsoftplus router + `tid2eid` static routing; swiglu clamp; attention sinks; and an **MXFP4 expert

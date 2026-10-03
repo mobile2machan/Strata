@@ -379,6 +379,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(native_dense_ple_key_test PRIVATE strata_engine)
     add_test(NAME native_dense_ple_key_test COMMAND native_dense_ple_key_test)
     set_tests_properties(native_dense_ple_key_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    # docs/DSV4.md P2 first step: the deepseek4 geometry reader and the deepseek4 shape checks, over a
+    # synthetic GGUF and a synthetic pack covering all four fixture layer classes (needs a device, 77 without)
+    add_executable(dsv4_layout_test tests/core/dsv4_layout_test.cpp)
+    target_link_libraries(dsv4_layout_test PRIVATE strata_engine)
+    add_test(NAME dsv4_layout_test COMMAND dsv4_layout_test)
+    set_tests_properties(dsv4_layout_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     # #369: per-layer admission on a sized (native pack) cache starts each layer in its own range
     add_executable(expert_cache_per_layer_test tests/core/expert_cache_per_layer_test.cpp)
     target_link_libraries(expert_cache_per_layer_test PRIVATE strata_engine)

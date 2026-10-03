@@ -2,6 +2,7 @@
 #include "strata/core/layout.hpp"
 
 #include <cstdio>
+#include <vector>
 
 namespace strata::core {
 namespace {
@@ -42,7 +43,112 @@ bool fail(std::string& err, const LayerView& v, const char* suffix, const char* 
     return false;
 }
 
+// ---- deepseek4 (docs/DSV4.md).  Every shape below was read off the UD-IQ2_XXS artifact's own tensor
+// directory, not derived from the metadata: the two compressor widths (2x key for r=4, key for r=128) and
+// the mHC parameter widths (6*hc and hc-1) are exactly the kind of number this file exists to pin down,
+// because nothing in the metadata states them and a wrong one decodes to plausible bytes.
+bool check_one_dsv4(const WeightTable& t, const ModelGeometry& g, int64_t layer, std::string& err) {
+    const LayerView v(t, layer);
+    const ModelGeometry::Dsv4& d = g.dsv4;
+    const int64_t r = dsv4_ratio(g, layer);
+    const bool indexed = r == 4;
+    const bool compressed = r > 0;
+    const bool hash = dsv4_is_hash_layer(g, layer);
+    // the overlapping variant (r=4) pools over 2x-wide input; the plain one (r=128) over key_length.
+    const int64_t comp_w = indexed ? 2 * g.head_dim : g.head_dim;
+    const int64_t mhc_fn = 6 * g.hc;   // hc_*_fn is [hc_dim, 6*hc], hc_*_base is (6*hc), hc_*_scale is (hc-1)
+
+    std::vector<Want2> want2 = {
+        // attention, EVERY layer: the LoRA-split Q (q_a then q_b), one KV head, the LoRA-split O.
+        {"attn_q_a.weight", g.n_embd, d.q_lora, false, false},
+        {"attn_q_b.weight", d.q_lora, g.n_head * g.head_dim, false, false},
+        {"attn_kv.weight", g.n_embd, g.n_head_kv * g.head_dim, false, false},
+        {"attn_output_a.weight", g.n_embd, d.o_groups * d.o_lora, false, false},
+        {"attn_output_b.weight", d.o_groups * d.o_lora, g.n_embd, false, false},
+        // mHC, EVERY layer (the GR plumbing's deepseek4 counterpart: a learned per-stream mixing)
+        {"hc_attn_fn.weight", g.hc_dim(), mhc_fn, false, false},
+        {"hc_ffn_fn.weight", g.hc_dim(), mhc_fn, false, false},
+        // MoE, EVERY layer - including the hash layers, which carry a router ALONGSIDE the tid2eid table
+        {"ffn_gate_inp.weight", g.n_embd, g.n_expert, false, false},
+        {"ffn_gate_shexp.weight", g.n_embd, g.n_ff, false, false},
+        {"ffn_up_shexp.weight", g.n_embd, g.n_ff, false, false},
+        {"ffn_down_shexp.weight", g.n_ff, g.n_embd, false, false},
+    };
+    if (compressed) {
+        want2.push_back({"attn_compressor_gate.weight", g.n_embd, comp_w, false, false});
+        want2.push_back({"attn_compressor_kv.weight", g.n_embd, comp_w, false, false});
+        want2.push_back({"attn_compressor_ape.weight", comp_w, r, false, false});
+    }
+    if (indexed) {
+        want2.push_back({"indexer.attn_q_b.weight", d.q_lora, g.idx_q_heads * g.idx_key_dim, false, false});
+        want2.push_back({"indexer.proj.weight", g.n_embd, g.idx_q_heads, false, false});
+        want2.push_back({"indexer_compressor_gate.weight", g.n_embd, 2 * g.idx_key_dim, false, false});
+        want2.push_back({"indexer_compressor_kv.weight", g.n_embd, 2 * g.idx_key_dim, false, false});
+        want2.push_back({"indexer_compressor_ape.weight", 2 * g.idx_key_dim, 4, false, false});
+    }
+    if (hash) want2.push_back({"ffn_gate_tid2eid.weight", d.n_expert_used, d.n_vocab, false, false});
+    for (const Want2& w : want2) {
+        const WeightRef* ref = v.get(w.suffix);
+        if (!ref) {
+            err = "layer " + std::to_string(layer) + ": missing " + v.name(w.suffix);
+            return false;
+        }
+        if (ref->ne0 != w.ne0) return fail(err, v, w.suffix, "ne0", ref->ne0, w.ne0);
+        if (ref->ne1 != w.ne1) return fail(err, v, w.suffix, "ne1", ref->ne1, w.ne1);
+    }
+    // The router's FORM, not just its shape: the pack stores it as raw BF16 (index kind 4, 2 B/elem) and
+    // `moe_route` reads BF16 logits.  A row that said F32 would hand the GEMV 2x the elements it walks.
+    if (const WeightRef* ref = v.get("ffn_gate_inp.weight")) {
+        if (ref->kind != WeightKind::Bf16InF32) {
+            char buf[512];
+            std::snprintf(buf, sizeof buf, "layer %lld: %s is engine form %d, the router reads it as %d",
+                          (long long) layer, v.name("ffn_gate_inp.weight").c_str(), (int) ref->kind,
+                          (int) WeightKind::Bf16InF32);
+            err = buf;
+            return false;
+        }
+    }
+
+    std::vector<Want1> want1 = {
+        {"attn_norm.weight", g.n_embd, WeightKind::F32, false, false},
+        {"ffn_norm.weight", g.n_embd, WeightKind::F32, false, false},
+        {"attn_q_a_norm.weight", d.q_lora, WeightKind::F32, false, false},
+        {"attn_kv_a_norm.weight", g.head_dim, WeightKind::F32, false, false},
+        {"attn_sinks.weight", g.n_head, WeightKind::F32, false, false},   // one learned sink logit per head
+        {"hc_attn_base.weight", mhc_fn, WeightKind::F32, false, false},
+        {"hc_attn_scale.weight", g.hc - 1, WeightKind::F32, false, false},
+        {"hc_ffn_base.weight", mhc_fn, WeightKind::F32, false, false},
+        {"hc_ffn_scale.weight", g.hc - 1, WeightKind::F32, false, false},
+    };
+    // exp_probs_b is the learned per-expert bias the sqrtsoftplus router adds.  The three hash layers do
+    // not have it (measured: 40 of 43) - their routing is the static tid2eid table.
+    if (!hash) want1.push_back({"exp_probs_b.bias", g.n_expert, WeightKind::F32, false, false});
+    if (compressed) want1.push_back({"attn_compressor_norm.weight", g.head_dim, WeightKind::F32, false, false});
+    if (indexed) want1.push_back({"indexer_compressor_norm.weight", g.idx_key_dim, WeightKind::F32, false, false});
+    for (const Want1& w : want1) {
+        const WeightRef* ref = v.get(w.suffix);
+        if (!ref) {
+            err = "layer " + std::to_string(layer) + ": missing " + v.name(w.suffix);
+            return false;
+        }
+        if (ref->elements != w.elements) return fail(err, v, w.suffix, "elements", ref->elements, w.elements);
+        if (ref->kind != w.kind) {
+            const uint64_t want_bytes = (uint64_t) w.elements *
+                                        (w.kind == WeightKind::Bf16InF32 ? 2u : 4u);
+            char buf[512];
+            std::snprintf(buf, sizeof buf,
+                          "layer %lld: %s is engine form %d (%llu B), the kernels read it as form %d (%llu B)",
+                          (long long) layer, v.name(w.suffix).c_str(), (int) ref->kind,
+                          (unsigned long long) ref->bytes, (int) w.kind, (unsigned long long) want_bytes);
+            err = buf;
+            return false;
+        }
+    }
+    return true;
+}
+
 bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std::string& err) {
+    if (g.arch == ModelArch::DeepSeek4) return check_one_dsv4(t, g, layer, err);
     const LayerView v(t, layer);
     const bool qsa = is_qsa_layer(g, layer);
 
@@ -147,6 +253,32 @@ bool check_layer(const WeightTable& table, const ModelGeometry& g, int64_t layer
 }
 
 bool check_all(const WeightTable& table, const ModelGeometry& g, std::string& err) {
+    if (g.arch == ModelArch::DeepSeek4) {
+        // The layer classes come from the artifact's own array; the cross-layer check is that the array
+        // COVERS every layer and only names classes the pack can serve.  The per-layer presence checks in
+        // `check_one_dsv4` already tie each class to its tensors, so a class the pack does not have fails
+        // there, not here.
+        if ((int64_t) g.dsv4.compress_ratios.size() < g.n_layers) {
+            err = "compress_ratios covers " + std::to_string(g.dsv4.compress_ratios.size()) +
+                  " layers, the model has " + std::to_string(g.n_layers);
+            return false;
+        }
+        if (g.dsv4.hash_layers < 0 || g.dsv4.hash_layers > g.n_layers) {
+            err = "hash_layer_count " + std::to_string(g.dsv4.hash_layers) + " is outside 0.." +
+                  std::to_string(g.n_layers);
+            return false;
+        }
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const int64_t r = dsv4_ratio(g, l);
+            if (r != 0 && r != 4 && r != 128) {
+                err = "layer " + std::to_string(l) + ": compress_ratio " + std::to_string(r) +
+                      " is a class no kernel implements (measured artifact: 0, 4, 128 only)";
+                return false;
+            }
+            if (!check_one(table, g, l, err)) return false;
+        }
+        return true;
+    }
     int64_t n_qsa = 0, n_gdn = 0;
     for (int64_t l = 0; l < g.n_layers; ++l) {
         if (!check_one(table, g, l, err)) return false;
