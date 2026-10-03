@@ -7,6 +7,7 @@
 #include "strata/kernels/dsv4_moe.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
 
@@ -117,15 +118,17 @@ void dsv4_ffn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnWe
     cudaMemcpy(h_ids.data(), s.ids, (size_t) k * 4, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_rw.data(), s.rw, (size_t) k * 4, cudaMemcpyDeviceToHost);
 
-    // ---- the shared expert: bf16 GEMVs and the clamped SwiGLU, weight 1.
-    kernels::bf16_gemv_fp32_mmvf(s.y, w.sh_gate, s.gu, dim, ff, cu);
-    kernels::bf16_gemv_fp32_mmvf(s.y, w.sh_up, s.gu + ff, dim, ff, cu);
+    // ---- the shared expert: native GGUF GEMVs on the q8_1 activation (the same block format the
+    // routed path uses, quantized once), and the clamped SwiGLU, weight 1.
+    kernels::quantize_q8_1_rows(s.y, 1, dim, s.xq, cu);
+    kernels::native_mmvq(w.sh_gate_type, w.sh_gate, s.xq, s.gu, (int) dim, (int) ff, 1, cu);
+    kernels::native_mmvq(w.sh_up_type, w.sh_up, s.xq, s.gu + ff, (int) dim, (int) ff, 1, cu);
     kernels::dsv4_swiglu(s.gu, s.gu + ff, s.ff, ff, g.dsv4.swiglu_clamp_shexp[(size_t) layer], cu);
-    kernels::bf16_gemv_fp32_mmvf(s.ff, w.sh_down, s.y2, ff, dim, cu);
+    kernels::quantize_q8_1_rows(s.ff, 1, ff, s.fq, cu);
+    kernels::native_mmvq(w.sh_down_type, w.sh_down, s.fq, s.y2, (int) ff, (int) dim, 1, cu);
 
     // ---- the routed experts: the pack's native blobs through iq_mmvq, q8_1 activations both
     // sides, the same clamped SwiGLU, then the router's weights onto each down output.
-    kernels::quantize_q8_1_rows(s.y, 1, dim, s.xq, cu);
     const float gu_limit = g.dsv4.swiglu_clamp_exp[(size_t) layer];
     for (int64_t e = 0; e < k; ++e) {
         const uint8_t* blob = w.expert_blobs + (int64_t) h_ids[(size_t) e] * w.experts.bytes;

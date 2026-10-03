@@ -10,6 +10,8 @@
 #include "strata/kernels/dsv4_quant.hpp"
 #include "strata/kernels/dsv4_rope.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
 
@@ -67,6 +69,9 @@ struct Scratch {
     int32_t* cmp_ids;  // [max(n_stage, idx_topk)]
     float* o;          // [n_head * head_dim]
     float* wo_tmp;     // [o_groups * o_lora]
+    uint8_t* xq_dim;   // q8_1 of an [n_embd] (or wo_a group-slice) activation
+    uint8_t* xq_qr;    // q8_1 of a [q_lora] activation
+    uint8_t* xq_ob;    // q8_1 of an [o_groups * o_lora] activation
 };
 
 Scratch carve(Cursor& c, const ModelGeometry& g, int64_t n_stage) {
@@ -100,6 +105,10 @@ Scratch carve(Cursor& c, const ModelGeometry& g, int64_t n_stage) {
     s.cmp_ids = c.take<int32_t>(n_stage > g.dsv4.idx_topk ? n_stage : g.dsv4.idx_topk);
     s.o = c.take<float>(g.n_head * g.head_dim);
     s.wo_tmp = c.take<float>(g.dsv4.o_groups * g.dsv4.o_lora);
+    const int64_t hpg_in = (g.n_head / g.dsv4.o_groups) * g.head_dim;
+    s.xq_dim = c.take<uint8_t>((int64_t) native_q8_1_bytes((int) (g.n_embd > hpg_in ? g.n_embd : hpg_in), 1));
+    s.xq_qr = c.take<uint8_t>((int64_t) native_q8_1_bytes((int) g.dsv4.q_lora, 1));
+    s.xq_ob = c.take<uint8_t>((int64_t) native_q8_1_bytes((int) (g.dsv4.o_groups * g.dsv4.o_lora), 1));
     return s;
 }
 
@@ -123,6 +132,15 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
     Cursor cur{(char*) scratch, 0, false};
     Scratch s = carve(cur, g, n_stage);
 
+    // A native GEMV: quantize the activation to q8_1 (the same block format the FFN half and the
+    // qwen dense path use), then the GGUF-block kernel for this tensor's type.  One q8_1 buffer
+    // per input width, reused across the GEMVs that share it.
+    auto gemm = [&](const float* x, int type, const uint8_t* wgt, float* y, int64_t n_in,
+                    int64_t n_out, uint8_t* xq) {
+        kernels::quantize_q8_1_rows(x, 1, n_in, xq, cu);
+        kernels::native_mmvq(type, wgt, xq, y, (int) n_in, (int) n_out, 1, cu);
+    };
+
     // ---- hc_pre(attn): mixes GEMV + RMS factor, split/Sinkhorn, collapse the streams.
     kernels::hc_mixes(stream_in, w.hc_fn, s.mixes, 1, hc * dim, mix_hc, g.dsv4.hc_eps, cu);
     kernels::hc_split_sinkhorn(s.mixes, w.hc_scale, w.hc_base, 1, hc, g.dsv4.sinkhorn_iters,
@@ -131,9 +149,9 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
 
     // ---- attn_norm, then the LoRA-split Q.
     kernels::rms_norm_weighted(s.y, w.norm, 1, dim, eps, cu);
-    kernels::bf16_gemv_fp32_mmvf(s.y, w.q_a, s.qr, dim, g.dsv4.q_lora, cu);
+    gemm(s.y, w.q_a_type, w.q_a, s.qr, dim, g.dsv4.q_lora, s.xq_dim);
     kernels::rms_norm_weighted(s.qr, w.q_a_norm, 1, g.dsv4.q_lora, eps, cu);
-    kernels::bf16_gemv_fp32_mmvf(s.qr, w.q_b, s.q, g.dsv4.q_lora, g.n_head * hd, cu);
+    gemm(s.qr, w.q_b_type, w.q_b, s.q, g.dsv4.q_lora, g.n_head * hd, s.xq_qr);
     kernels::rms_norm_weighted(s.q, nullptr, g.n_head, hd, eps, cu);
     // attention rope: YaRN only on compressed layers (the reference's original_seq_len is 0 for
     // r=0 layers).
@@ -142,7 +160,7 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
                            attn_orig, g.dsv4.yarn_beta_fast, g.dsv4.yarn_beta_slow, false, cu);
 
     // ---- kv: one head, norm, rope, e4m3 round-trip on the non-rope part, ring write.
-    kernels::bf16_gemv_fp32_mmvf(s.y, w.kv, s.kv, dim, hd, cu);
+    gemm(s.y, w.kv_type, w.kv, s.kv, dim, hd, s.xq_dim);
     kernels::rms_norm_weighted(s.kv, w.kv_norm, 1, hd, eps, cu);
     kernels::dsv4_rope_f32(s.kv, 1, hd, rd, pos, g.dsv4.rope_theta, g.dsv4.yarn_factor, attn_orig,
                            g.dsv4.yarn_beta_fast, g.dsv4.yarn_beta_slow, false, cu);
@@ -154,8 +172,8 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
     // ---- compressor decode + cmp pool write.
     if (compressed) {
         const int64_t item = (indexed ? 2 : 1) * hd;
-        kernels::bf16_gemv_fp32_mmvf(s.y, w.comp_kv, s.ckv, dim, item, cu);
-        kernels::bf16_gemv_fp32_mmvf(s.y, w.comp_gate, s.csc, dim, item, cu);
+        gemm(s.y, w.comp_kv_type, w.comp_kv, s.ckv, dim, item, s.xq_dim);
+        gemm(s.y, w.comp_gate_type, w.comp_gate, s.csc, dim, item, s.xq_dim);
         kernels::compressor_decode_step(pos, ratio, indexed, hd, s.ckv, s.csc, w.ape, st.ks, st.ss,
                                         s.cmp_f, cu);
         if ((pos + 1) % ratio == 0) {
@@ -176,8 +194,8 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
     int64_t n_cmp = 0;
     if (indexed) {
         // indexer q: rope, hadamard, e2m1 round-trip; weights GEMV with the folded scale.
-        kernels::bf16_gemv_fp32_mmvf(s.qr, w.idx_qb, s.iq, g.dsv4.q_lora,
-                                     g.idx_q_heads * g.idx_key_dim, cu);
+        gemm(s.qr, w.idx_qb_type, w.idx_qb, s.iq, g.dsv4.q_lora,
+             g.idx_q_heads * g.idx_key_dim, s.xq_qr);
         kernels::dsv4_rope_f32(s.iq, g.idx_q_heads, g.idx_key_dim, rd, pos,
                                g.dsv4.compress_rope_theta, g.dsv4.yarn_factor, g.dsv4.yarn_orig,
                                g.dsv4.yarn_beta_fast, g.dsv4.yarn_beta_slow, false, cu);
@@ -189,8 +207,8 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
         kernels::scale_inplace(s.iq_w, g.idx_q_heads, idx_scale, cu);
         // the indexer's own compressor, rotate=True: hadamard + e2m1 over the whole row.
         const int64_t iitem = 2 * g.idx_key_dim;
-        kernels::bf16_gemv_fp32_mmvf(s.y, w.idx_comp_kv, s.ikv, dim, iitem, cu);
-        kernels::bf16_gemv_fp32_mmvf(s.y, w.idx_comp_gate, s.isc, dim, iitem, cu);
+        gemm(s.y, w.idx_comp_kv_type, w.idx_comp_kv, s.ikv, dim, iitem, s.xq_dim);
+        gemm(s.y, w.idx_comp_gate_type, w.idx_comp_gate, s.isc, dim, iitem, s.xq_dim);
         kernels::compressor_decode_step(pos, 4, true, g.idx_key_dim, s.ikv, s.isc, w.idx_ape, st.iks,
                                         st.iss, s.icmp_f, cu);
         if ((pos + 1) % 4 == 0) {
@@ -248,11 +266,13 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
                            attn_orig, g.dsv4.yarn_beta_fast, g.dsv4.yarn_beta_slow, true, cu);
 
     // ---- wo: the grouped einsum is one GEMV per group over the flattened wo_a, then wo_b.
+    // The group offset is in BYTES: a quantized row is not `dim` bytes wide.
     const int64_t hpg = g.n_head / g.dsv4.o_groups;
+    const int64_t oa_row_bytes = (int64_t) native_mmvq_weight_bytes(w.out_a_type, (int) (hpg * hd), 1);
     for (int64_t gr = 0; gr < g.dsv4.o_groups; ++gr)
-        kernels::bf16_gemv_fp32_mmvf(s.o + gr * hpg * hd, w.out_a + gr * g.dsv4.o_lora * dim,
-                                     s.wo_tmp + gr * g.dsv4.o_lora, hpg * hd, g.dsv4.o_lora, cu);
-    kernels::bf16_gemv_fp32_mmvf(s.wo_tmp, w.out_b, s.y, g.dsv4.o_groups * g.dsv4.o_lora, dim, cu);
+        gemm(s.o + gr * hpg * hd, w.out_a_type, w.out_a + gr * g.dsv4.o_lora * oa_row_bytes,
+             s.wo_tmp + gr * g.dsv4.o_lora, hpg * hd, g.dsv4.o_lora, s.xq_dim);
+    gemm(s.wo_tmp, w.out_b_type, w.out_b, s.y, g.dsv4.o_groups * g.dsv4.o_lora, dim, s.xq_ob);
 
     // ---- hc_post(attn).
     kernels::hc_post_combine(s.y, stream_in, s.post, s.comb, stream_out, 1, hc, dim, cu);

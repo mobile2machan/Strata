@@ -5,14 +5,14 @@
 // from the hc=4 residual stream in to the stream out:
 //
 //   hc_pre(ffn) -> ffn_norm -> router (bf16 GEMV, then sqrtsoftplus+bias top-k, or the tid2eid
-//   table for a hash layer) -> shared expert (bf16 GEMVs + clamped SwiGLU) -> the top-k routed
-//   experts (q8_1 activation, the pack's native expert blobs through `iq_mmvq`, clamped SwiGLU,
-//   q8_1 again, down) weighted-summed -> shared + routed -> hc_post(ffn).
+//   table for a hash layer) -> shared expert (q8_1 activation, native GGUF GEMVs, clamped SwiGLU)
+//   -> the top-k routed experts (q8_1 activation, the pack's native expert blobs through `iq_mmvq`,
+//   clamped SwiGLU, q8_1 again, down) weighted-summed -> shared + routed -> hc_post(ffn).
 //
-// The shared expert is addressed as bf16 device pointers: the GGUF stores it quantized, and the
-// session resolver dequantizes (or serves the same values through the dense path) - the GEMV math
-// is value-identical either way.  The routed experts are the pack's own format: `expert_blobs` is
-// `n_expert` contiguous blobs in `NativeExpertLayout` order, exactly as `experts.bin` stores them.
+// The shared expert is addressed as native GGUF blocks + type id, like the real pack serves it
+// (measured: Q5_K gate/up, Q6_K down in UD-IQ2_XXS, skipped from dense.bin and attached by
+// NativeDense).  The routed experts are the pack's own format: `expert_blobs` is `n_expert`
+// contiguous blobs in `NativeExpertLayout` order, exactly as `experts.bin` stores them.
 //
 // `scratch` is caller-owned workspace sized by `dsv4_ffn_scratch_bytes`.  `token_id` selects the
 // hash table row on a hash layer and is ignored otherwise.  Nothing here allocates.
@@ -33,9 +33,9 @@ struct Dsv4FfnWeights {
     const uint16_t* gate = nullptr;    ///< ffn_gate_inp [n_expert][n_embd] bf16
     const float* probs_b = nullptr;    ///< exp_probs_b [n_expert] f32 (null on a hash layer)
     const int32_t* tid2eid = nullptr;  ///< [n_expert_used][vocab] I32 (null unless a hash layer)
-    const uint16_t* sh_gate = nullptr;  ///< ffn_gate_shexp [n_ff][n_embd] bf16
-    const uint16_t* sh_up = nullptr;    ///< ffn_up_shexp   [n_ff][n_embd] bf16
-    const uint16_t* sh_down = nullptr;  ///< ffn_down_shexp [n_embd][n_ff]  bf16
+    int sh_gate_type = -1;  const uint8_t* sh_gate = nullptr;  ///< ffn_gate_shexp [n_ff][n_embd]
+    int sh_up_type = -1;    const uint8_t* sh_up = nullptr;    ///< ffn_up_shexp   [n_ff][n_embd]
+    int sh_down_type = -1;  const uint8_t* sh_down = nullptr;  ///< ffn_down_shexp [n_embd][n_ff]
     kernels::NativeExpertLayout experts;
     const uint8_t* expert_blobs = nullptr;  ///< n_expert * experts.bytes, contiguous
 };

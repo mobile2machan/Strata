@@ -78,6 +78,8 @@ int main(int argc, char** argv) {
     }
     std::printf("dsv4_block_layer_parity: full-block join, block == halves in sequence\n");
     ggml_cpu_init();
+    // native_mmvq requires an explicit non-null stream.
+    static cudaStream_t g_stream = [] { cudaStream_t s; cudaStreamCreate(&s); return s; }();
 
     core::ModelGeometry g;
     g.n_layers = 2;
@@ -130,18 +132,32 @@ int main(int argc, char** argv) {
     for (int64_t L = 0; L < g.n_layers; ++L) {
         auto& a = wa[(size_t) L];
         auto& f = wf[(size_t) L];
-        // attention half
-        to_dev(rand_bf16(dim * g.dsv4.q_lora, 0.02), &a.q_a);
-        to_dev(rand_bf16(g.dsv4.q_lora * g.n_head * hd, 0.02), &a.q_b);
-        to_dev(rand_bf16(dim * hd, 0.02), &a.kv);
-        to_dev(rand_bf16(dim * g.dsv4.o_groups * g.dsv4.o_lora, 0.02), &a.out_a);
-        to_dev(rand_bf16(g.dsv4.o_groups * g.dsv4.o_lora * dim, 0.02), &a.out_b);
-        to_dev(rand_bf16(dim * 2 * hd, 0.02), &a.comp_kv);
-        to_dev(rand_bf16(dim * 2 * hd, 0.02), &a.comp_gate);
-        to_dev(rand_bf16(g.dsv4.q_lora * g.idx_q_heads * g.idx_key_dim, 0.02), &a.idx_qb);
+        // attention half: native Q8_0 blobs, like the real pack serves them
+        auto set_gemm = [&](int64_t rows, int64_t cols, double sd, auto* dp, int* tp) {
+            std::vector<float> wt((size_t)(rows * cols));
+            for (auto& v : wt) v = (float)(nrm() * sd);
+            std::vector<uint8_t> b((size_t)(rows * cols / 32 * 34));
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, wt.data(), b.data(), 0, rows, cols, nullptr);
+            void* p = nullptr;
+            check(cudaMalloc(&p, b.size()), "weights");
+            cudaMemcpy(p, b.data(), b.size(), cudaMemcpyHostToDevice);
+            keep.push_back(p);
+            *dp = (const uint8_t*) p;
+            *tp = GGML_TYPE_Q8_0;
+        };
+        // rows = n_out, cols = n_in: the GEMV reads each output row as one contiguous run.
+        set_gemm(g.dsv4.q_lora, dim, 0.02, &a.q_a, &a.q_a_type);
+        set_gemm(g.n_head * hd, g.dsv4.q_lora, 0.02, &a.q_b, &a.q_b_type);
+        set_gemm(hd, dim, 0.02, &a.kv, &a.kv_type);
+        set_gemm(g.dsv4.o_groups * g.dsv4.o_lora, (g.n_head / g.dsv4.o_groups) * hd, 0.02, &a.out_a,
+                 &a.out_a_type);
+        set_gemm(dim, g.dsv4.o_groups * g.dsv4.o_lora, 0.02, &a.out_b, &a.out_b_type);
+        set_gemm(2 * hd, dim, 0.02, &a.comp_kv, &a.comp_kv_type);
+        set_gemm(2 * hd, dim, 0.02, &a.comp_gate, &a.comp_gate_type);
+        set_gemm(g.idx_q_heads * g.idx_key_dim, g.dsv4.q_lora, 0.02, &a.idx_qb, &a.idx_qb_type);
+        set_gemm(2 * g.idx_key_dim, dim, 0.02, &a.idx_comp_kv, &a.idx_comp_kv_type);
+        set_gemm(2 * g.idx_key_dim, dim, 0.02, &a.idx_comp_gate, &a.idx_comp_gate_type);
         to_dev(rand_bf16(dim * g.idx_q_heads, 0.02), &a.idx_proj);
-        to_dev(rand_bf16(dim * 2 * g.idx_key_dim, 0.02), &a.idx_comp_kv);
-        to_dev(rand_bf16(dim * 2 * g.idx_key_dim, 0.02), &a.idx_comp_gate);
         to_dev(ones_f32(dim, 0.1), &a.norm);
         to_dev(ones_f32(g.dsv4.q_lora, 0.1), &a.q_a_norm);
         to_dev(ones_f32(hd, 0.1), &a.kv_norm);
@@ -160,9 +176,9 @@ int main(int argc, char** argv) {
         to_dev(ones_f32(dim, 0.1), &f.norm);
         to_dev(rand_bf16(g.n_expert * dim, 0.02), &f.gate);
         if (L >= g.dsv4.hash_layers) to_dev(rand_f32(g.n_expert, 2.0), &f.probs_b);
-        to_dev(rand_bf16(ff * dim, 0.15), &f.sh_gate);
-        to_dev(rand_bf16(ff * dim, 0.15), &f.sh_up);
-        to_dev(rand_bf16(dim * ff, 0.02), &f.sh_down);
+        set_gemm(ff, dim, 0.15, &f.sh_gate, &f.sh_gate_type);
+        set_gemm(ff, dim, 0.15, &f.sh_up, &f.sh_up_type);
+        set_gemm(dim, ff, 0.02, &f.sh_down, &f.sh_down_type);
     }
     std::vector<int32_t> tid2eid((size_t) k * vocab);
     for (auto& v : tid2eid) v = (int32_t)(rng() % (unsigned) g.n_expert);
@@ -235,10 +251,10 @@ int main(int argc, char** argv) {
         for (int64_t pos = 0; pos < ntok; ++pos) {
             const int64_t n_stage = ratio > 0 ? (pos + 1) / ratio : 0;
             core::dsv4_block_decode_step(g, layer, w, st_b, stream_in, stream_out, pos, pos, n_stage,
-                                         s_blk, nullptr);
+                                         s_blk, g_stream);
             core::dsv4_attn_decode_step(g, layer, w.attn, st_s, stream_in, mid, pos, n_stage, s_attn,
-                                        nullptr);
-            core::dsv4_ffn_decode_step(g, layer, w.ffn, mid, seq_out, pos, s_ffn, nullptr);
+                                        g_stream);
+            core::dsv4_ffn_decode_step(g, layer, w.ffn, mid, seq_out, pos, s_ffn, g_stream);
             std::vector<float> a((size_t) hc * dim), b((size_t) hc * dim);
             cudaMemcpy(a.data(), stream_out, (size_t) hc * dim * 4, cudaMemcpyDeviceToHost);
             cudaMemcpy(b.data(), seq_out, (size_t) hc * dim * 4, cudaMemcpyDeviceToHost);

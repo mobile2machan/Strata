@@ -17,6 +17,11 @@
 #include "strata/core/dsv4_state.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/dsv4_quant.hpp"
+#include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
+#include "ggml.h"
+#include "ggml-cpu.h"
 
 #include <cuda_runtime.h>
 
@@ -61,13 +66,35 @@ double nrm() {
     return nd(rng);
 }
 
-// ---- host weight set (values; the engine gets bf16/f32 device copies of the same numbers)
+// ---- host weight set (values; the engine gets Q8_0 blobs / f32 device copies of the same numbers)
 struct HostW {
-    std::vector<uint16_t> q_a, q_b, kv, out_a, out_b, comp_kv, comp_gate, idx_qb, idx_proj,
-        idx_comp_kv, idx_comp_gate;
+    std::vector<float> q_a, q_b, kv, out_a, out_b, comp_kv, comp_gate, idx_qb, idx_comp_kv,
+        idx_comp_gate;  // dequantized Q8_0 values - what the kernel sees
+    std::vector<uint16_t> idx_proj;
     std::vector<float> norm, q_a_norm, kv_norm, sinks, hc_fn, hc_base, hc_scale, ape, comp_norm,
         idx_ape, idx_comp_norm;
 };
+
+// A Q8_0 blob of random weights, and its exact dequantization (the reference dots with the values
+// the native kernel sees, not the pre-quantization ones - same contract as the FFN test).
+std::vector<uint8_t> q8_blob(int64_t rows, int64_t cols, double sd) {
+    std::vector<float> w((size_t)(rows * cols));
+    for (auto& v : w) v = (float)(nrm() * sd);
+    std::vector<uint8_t> b((size_t)(rows * cols / 32 * 34));
+    ggml_quantize_chunk(GGML_TYPE_Q8_0, w.data(), b.data(), 0, rows, cols, nullptr);
+    return b;
+}
+std::vector<float> q8_deq(const std::vector<uint8_t>& b, int64_t n) {
+    std::vector<float> v((size_t) n);
+    for (int64_t blk = 0; blk < n / 32; ++blk) {
+        const uint16_t hb = (uint16_t) b[(size_t) blk * 34] |
+                            ((uint16_t) b[(size_t) blk * 34 + 1] << 8);
+        const float d = strata::kernels::f32_from_f16(hb);
+        for (int i = 0; i < 32; ++i)
+            v[(size_t) blk * 32 + i] = d * (float)(int8_t) b[(size_t) blk * 34 + 2 + i];
+    }
+    return v;
+}
 
 std::vector<uint16_t> rand_bf16(int64_t n, double sd) {
     std::vector<uint16_t> v((size_t) n);
@@ -235,6 +262,16 @@ void ref_gemv(const std::vector<double>& x, const std::vector<uint16_t>& w, int6
         y[(size_t) o] = acc;
     }
 }
+void ref_gemv(const std::vector<double>& x, const std::vector<float>& w, int64_t n_in,
+              int64_t n_out, std::vector<double>& y) {
+    y.assign((size_t) n_out, 0.0);
+    for (int64_t o = 0; o < n_out; ++o) {
+        const float* wr = &w[(size_t) o * n_in];
+        double acc = 0;
+        for (int64_t i = 0; i < n_in; ++i) acc += x[(size_t) i] * (double) wr[i];
+        y[(size_t) o] = acc;
+    }
+}
 struct Shape {
     int64_t ratio;
     bool overlap;
@@ -293,6 +330,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::printf("dsv4_attn_parity: attention-half layer wiring, 8 tokens, r=4\n");
+    ggml_cpu_init();
+    // native_mmvq requires an explicit non-null stream.
+    static cudaStream_t g_stream = [] { cudaStream_t s; cudaStreamCreate(&s); return s; }();
 
     // ---- geometry: the real artifact's dimensions; idx_topk 1 so selection discards a real row.
     core::ModelGeometry g;
@@ -322,19 +362,34 @@ int main(int argc, char** argv) {
     const int64_t dim = g.n_embd, hd = g.head_dim, rd = g.dsv4.rope_dim, hc = g.hc;
     const int64_t ntok = 8;
 
-    // ---- weights
+    // ---- weights: Q8_0 blobs for the engine (the real pack's native form), their dequantized
+    // values for the reference.
     HostW hw;
-    hw.q_a = rand_bf16(dim * g.dsv4.q_lora, 0.02);
-    hw.q_b = rand_bf16(g.dsv4.q_lora * g.n_head * hd, 0.02);
-    hw.kv = rand_bf16(dim * hd, 0.02);
-    hw.out_a = rand_bf16(dim * g.dsv4.o_groups * g.dsv4.o_lora, 0.02);
-    hw.out_b = rand_bf16(g.dsv4.o_groups * g.dsv4.o_lora * dim, 0.02);
-    hw.comp_kv = rand_bf16(dim * 2 * hd, 0.02);
-    hw.comp_gate = rand_bf16(dim * 2 * hd, 0.02);
-    hw.idx_qb = rand_bf16(g.dsv4.q_lora * g.idx_q_heads * g.idx_key_dim, 0.02);
+    core::Dsv4AttnWeights w;
+    std::vector<std::vector<uint8_t>> blob(10);
+    auto set_gemm = [&](int i, int64_t rows, int64_t cols, double sd, std::vector<float>& refv,
+                        auto* dp, int* tp) {
+        blob[(size_t) i] = q8_blob(rows, cols, sd);
+        refv = q8_deq(blob[(size_t) i], rows * cols);
+        void* p = nullptr;
+        check(cudaMalloc(&p, blob[(size_t) i].size()), "weights");
+        cudaMemcpy(p, blob[(size_t) i].data(), blob[(size_t) i].size(), cudaMemcpyHostToDevice);
+        *dp = (const uint8_t*) p;
+        *tp = GGML_TYPE_Q8_0;
+    };
+    // rows = n_out, cols = n_in: the GEMV reads each output row as one contiguous quantized run.
+    set_gemm(0, g.dsv4.q_lora, dim, 0.02, hw.q_a, &w.q_a, &w.q_a_type);
+    set_gemm(1, g.n_head * hd, g.dsv4.q_lora, 0.02, hw.q_b, &w.q_b, &w.q_b_type);
+    set_gemm(2, hd, dim, 0.02, hw.kv, &w.kv, &w.kv_type);
+    set_gemm(3, g.dsv4.o_groups * g.dsv4.o_lora, (g.n_head / g.dsv4.o_groups) * hd, 0.02, hw.out_a,
+             &w.out_a, &w.out_a_type);
+    set_gemm(4, dim, g.dsv4.o_groups * g.dsv4.o_lora, 0.02, hw.out_b, &w.out_b, &w.out_b_type);
+    set_gemm(5, 2 * hd, dim, 0.02, hw.comp_kv, &w.comp_kv, &w.comp_kv_type);
+    set_gemm(6, 2 * hd, dim, 0.02, hw.comp_gate, &w.comp_gate, &w.comp_gate_type);
+    set_gemm(7, g.idx_q_heads * g.idx_key_dim, g.dsv4.q_lora, 0.02, hw.idx_qb, &w.idx_qb, &w.idx_qb_type);
+    set_gemm(8, 2 * g.idx_key_dim, dim, 0.02, hw.idx_comp_kv, &w.idx_comp_kv, &w.idx_comp_kv_type);
+    set_gemm(9, 2 * g.idx_key_dim, dim, 0.02, hw.idx_comp_gate, &w.idx_comp_gate, &w.idx_comp_gate_type);
     hw.idx_proj = rand_bf16(dim * g.idx_q_heads, 0.02);
-    hw.idx_comp_kv = rand_bf16(dim * 2 * g.idx_key_dim, 0.02);
-    hw.idx_comp_gate = rand_bf16(dim * 2 * g.idx_key_dim, 0.02);
     hw.norm = ones_f32(dim, 0.1);
     hw.q_a_norm = ones_f32(g.dsv4.q_lora, 0.1);
     hw.kv_norm = ones_f32(hd, 0.1);
@@ -348,7 +403,6 @@ int main(int argc, char** argv) {
     hw.idx_ape = rand_f32(4 * 2 * g.idx_key_dim, 0.5);
     hw.idx_comp_norm = ones_f32(g.idx_key_dim, 0.1);
 
-    core::Dsv4AttnWeights w;
     auto to_dev = [&](const auto& host, auto* dp) {
         using T = std::remove_reference_t<decltype(*dp)>;
         void* p = nullptr;
@@ -356,17 +410,7 @@ int main(int argc, char** argv) {
         cudaMemcpy(p, host.data(), host.size() * sizeof(host[0]), cudaMemcpyHostToDevice);
         *dp = (T) p;
     };
-    to_dev(hw.q_a, &w.q_a);
-    to_dev(hw.q_b, &w.q_b);
-    to_dev(hw.kv, &w.kv);
-    to_dev(hw.out_a, &w.out_a);
-    to_dev(hw.out_b, &w.out_b);
-    to_dev(hw.comp_kv, &w.comp_kv);
-    to_dev(hw.comp_gate, &w.comp_gate);
-    to_dev(hw.idx_qb, &w.idx_qb);
     to_dev(hw.idx_proj, &w.idx_proj);
-    to_dev(hw.idx_comp_kv, &w.idx_comp_kv);
-    to_dev(hw.idx_comp_gate, &w.idx_comp_gate);
     to_dev(hw.norm, &w.norm);
     to_dev(hw.q_a_norm, &w.q_a_norm);
     to_dev(hw.kv_norm, &w.kv_norm);
@@ -560,7 +604,7 @@ int main(int argc, char** argv) {
             std::vector<double> slice(o.begin() + (ptrdiff_t)(gr * hpg * hd),
                                      o.begin() + (ptrdiff_t)((gr + 1) * hpg * hd));
             std::vector<double> part;
-            ref_gemv(slice, std::vector<uint16_t>(
+            ref_gemv(slice, std::vector<float>(
                                  hw.out_a.begin() + (ptrdiff_t)(gr * g.dsv4.o_lora * dim),
                                  hw.out_a.begin() + (ptrdiff_t)((gr + 1) * g.dsv4.o_lora * dim)),
                      hpg * hd, g.dsv4.o_lora, part);
@@ -590,7 +634,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < in_f.size(); ++i) in_f[i] = (float) streams[(size_t) pos][i];
         cudaMemcpy(d_in, in_f.data(), in_f.size() * 4, cudaMemcpyHostToDevice);
         const int64_t valid = core::dsv4_cmp_valid(pos, 4);
-        core::dsv4_attn_decode_step(g, 0, w, st, d_in, d_out, pos, valid, scratch, nullptr);
+        core::dsv4_attn_decode_step(g, 0, w, st, d_in, d_out, pos, valid, scratch, g_stream);
         std::vector<float> out_f(in_f.size());
         cudaMemcpy(out_f.data(), d_out, out_f.size() * 4, cudaMemcpyDeviceToHost);
         engine_out[(size_t) pos].assign(out_f.begin(), out_f.end());
@@ -599,7 +643,10 @@ int main(int argc, char** argv) {
         cudaFree(d_out);
         const double r = rel_l1(ref_out[(size_t) pos], engine_out[(size_t) pos]);
         std::printf("  token %lld rel_l1 %.3e\n", (long long) pos, r);
-        expect(r < 1e-3, "stream out matches reference");
+        // The native path quantizes every GEMV activation to q8_1 (one scale per 32 elements);
+        // that noise measures ~5e-3 per GEMV standalone and ~2e-2 accumulated through the
+        // attention chain.  Wrong wiring is O(1) - see the traps below.
+        expect(r < 3e-2, "stream out matches reference");
     }
 
     // ---- pools must match too (the addressing is only observable through them)
@@ -613,9 +660,9 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < a.size(); ++i) { da[i] = f32_from_bf16(a[i]); db[i] = f32_from_bf16(b[i]); }
             return rel_l1(da, db);
         };
-        expect(cmp_pool(ref_win, eng_win) < 1e-3, "window pool matches");
-        expect(cmp_pool(ref_cmp, eng_cmp) < 1e-3, "cmp pool matches");
-        expect(cmp_pool(ref_idx, eng_idx) < 1e-3, "idx pool matches");
+        expect(cmp_pool(ref_win, eng_win) < 1e-2, "window pool matches");
+        expect(cmp_pool(ref_cmp, eng_cmp) < 1e-2, "cmp pool matches");
+        expect(cmp_pool(ref_idx, eng_idx) < 1e-2, "idx pool matches");
     }
 
     // ---- traps: the same reference with one wrong wiring must be observably apart
@@ -636,7 +683,7 @@ int main(int argc, char** argv) {
         ref_token(streams[(size_t) (ntok - 1)], ntok - 1, kv.second, t_out);
         const double r = rel_l1(t_out, engine_out[(size_t) (ntok - 1)]);
         std::printf("    %-30s apart by %.3e\n", kv.first, r);
-        expect(r > 1e-2, kv.first);
+        expect(r > 1e-1, kv.first);
     }
 
     std::printf("dsv4_attn_parity: %s\n", failures == 0 ? "ok" : "*** FAIL ***");

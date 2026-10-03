@@ -78,6 +78,18 @@ std::vector<float> ones_f32(int64_t n, double jitter) {
     for (int64_t i = 0; i < n; ++i) v[(size_t) i] = (float)(1.0 + jitter * nrm());
     return v;
 }
+// exact dequantization of a Q8_0 blob (half d + int8 qs[32], 34 B per 32)
+std::vector<float> q8_deq(const std::vector<uint8_t>& b, int64_t n) {
+    std::vector<float> v((size_t) n);
+    for (int64_t blk = 0; blk < n / 32; ++blk) {
+        const uint16_t hb = (uint16_t) b[(size_t) blk * 34] |
+                            ((uint16_t) b[(size_t) blk * 34 + 1] << 8);
+        const float d = kernels::f32_from_f16(hb);
+        for (int i = 0; i < 32; ++i)
+            v[(size_t) blk * 32 + i] = d * (float)(int8_t) b[(size_t) blk * 34 + 2 + i];
+    }
+    return v;
+}
 
 void* dalloc(size_t bytes) {
     void* p = nullptr;
@@ -103,6 +115,8 @@ int main(int argc, char** argv) {
     }
     std::printf("dsv4_ffn_layer_parity: FFN-half layer wiring, router + hash + packed experts\n");
     ggml_cpu_init();
+    // native_mmvq requires an explicit non-null stream.
+    static cudaStream_t g_stream = [] { cudaStream_t s; cudaStreamCreate(&s); return s; }();
 
     core::ModelGeometry g;
     g.n_layers = 2;
@@ -123,11 +137,15 @@ int main(int argc, char** argv) {
     const int64_t mix_hc = (2 + hc) * hc;
     const int64_t vocab = 16;
 
-    // ---- weights (host values; the engine gets device copies)
+    // ---- weights (host values; the engine gets device copies).  The shared expert is Q8_0 blobs
+    // (the pack's native form; the real artifact's Q5_K/Q6_K are the same native path, vouched by
+    // the qwen dense parity), the reference dots with their exact dequantization.
     std::vector<std::vector<float>> hc_fn((size_t) g.n_layers), hc_base((size_t) g.n_layers),
         hc_scale((size_t) g.n_layers), norm((size_t) g.n_layers), probs_b((size_t) g.n_layers);
-    std::vector<std::vector<uint16_t>> gate((size_t) g.n_layers), sh_g((size_t) g.n_layers),
-        sh_u((size_t) g.n_layers), sh_d((size_t) g.n_layers);
+    std::vector<std::vector<float>> sh_g((size_t) g.n_layers), sh_u((size_t) g.n_layers),
+        sh_d((size_t) g.n_layers);
+    std::vector<std::vector<uint8_t>> sh_blob((size_t) g.n_layers * 3);
+    std::vector<std::vector<uint16_t>> gate((size_t) g.n_layers);
     std::vector<int32_t> tid2eid((size_t) k * vocab);
     for (auto& v : tid2eid) v = (int32_t)(rng() % (unsigned) g.n_expert);
     for (int64_t L = 0; L < g.n_layers; ++L) {
@@ -138,9 +156,17 @@ int main(int argc, char** argv) {
         gate[(size_t) L] = rand_bf16(g.n_expert * dim, 0.02);
         probs_b[(size_t) L] = rand_f32(g.n_expert, 2.0);  // big enough that dropping it flips the picks
         // sd 0.15 over 4096 inputs puts the shared expert's gate/up past the +-10 clamp on purpose.
-        sh_g[(size_t) L] = rand_bf16(ff * dim, 0.15);
-        sh_u[(size_t) L] = rand_bf16(ff * dim, 0.15);
-        sh_d[(size_t) L] = rand_bf16(dim * ff, 0.02);
+        auto q8 = [&](int64_t rows, int64_t cols, double sd, int idx, std::vector<float>& refv) {
+            std::vector<float> w((size_t)(rows * cols));
+            for (auto& v : w) v = (float)(nrm() * sd);
+            sh_blob[(size_t) idx].resize((size_t)(rows * cols / 32 * 34));
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, w.data(), sh_blob[(size_t) idx].data(), 0, rows, cols,
+                                nullptr);
+            refv = q8_deq(sh_blob[(size_t) idx], rows * cols);
+        };
+        q8(ff, dim, 0.15, (int) L * 3 + 0, sh_g[(size_t) L]);
+        q8(ff, dim, 0.15, (int) L * 3 + 1, sh_u[(size_t) L]);
+        q8(dim, ff, 0.02, (int) L * 3 + 2, sh_d[(size_t) L]);
     }
 
     // ---- expert blobs: the real pair at the real dims, ggml-quantized from random weights
@@ -194,9 +220,14 @@ int main(int argc, char** argv) {
         keep_dev(norm[(size_t) L2], &ww.norm);
         keep_dev(gate[(size_t) L2], &ww.gate);
         if (L2 >= g.dsv4.hash_layers) keep_dev(probs_b[(size_t) L2], &ww.probs_b);
-        keep_dev(sh_g[(size_t) L2], &ww.sh_gate);
-        keep_dev(sh_u[(size_t) L2], &ww.sh_up);
-        keep_dev(sh_d[(size_t) L2], &ww.sh_down);
+        for (int j = 0; j < 3; ++j) {
+            void* p = to_dev(sh_blob[(size_t) L2 * 3 + (size_t) j]);
+            keep.push_back(p);
+            const uint8_t* dp = (const uint8_t*) p;
+            if (j == 0) { ww.sh_gate = dp; ww.sh_gate_type = GGML_TYPE_Q8_0; }
+            if (j == 1) { ww.sh_up = dp; ww.sh_up_type = GGML_TYPE_Q8_0; }
+            if (j == 2) { ww.sh_down = dp; ww.sh_down_type = GGML_TYPE_Q8_0; }
+        }
         ww.experts = L;
         ww.expert_blobs = (const uint8_t*) d_blobs;
         if (L2 < g.dsv4.hash_layers) ww.tid2eid = (const int32_t*) d_tid;
@@ -320,8 +351,8 @@ int main(int argc, char** argv) {
             for (int64_t r = 0; r < ff; ++r) {
                 double dg = 0, du = 0;
                 for (int64_t i = 0; i < dim; ++i) {
-                    dg += y[(size_t) i] * (double) f32_from_bf16(sg[(size_t) r * dim + i]);
-                    du += y[(size_t) i] * (double) f32_from_bf16(su[(size_t) r * dim + i]);
+                    dg += y[(size_t) i] * (double) sg[(size_t) r * dim + i];
+                    du += y[(size_t) i] * (double) su[(size_t) r * dim + i];
                 }
                 if (trap.clamp > 0) {
                     if (dg > trap.clamp) dg = trap.clamp;
@@ -332,7 +363,7 @@ int main(int argc, char** argv) {
             }
             for (int64_t cc = 0; cc < dim; ++cc) {
                 double a2 = 0;
-                for (int64_t r = 0; r < ff; ++r) a2 += h[(size_t) r] * (double) f32_from_bf16(sd[(size_t) cc * ff + r]);
+                for (int64_t r = 0; r < ff; ++r) a2 += h[(size_t) r] * (double) sd[(size_t) cc * ff + r];
                 acc_out[(size_t) cc] = a2;
             }
         }
@@ -432,7 +463,8 @@ int main(int argc, char** argv) {
         std::vector<float> in_f(stream.size());
         for (size_t i = 0; i < in_f.size(); ++i) in_f[i] = (float) stream[i];
         cudaMemcpy(d_in, in_f.data(), in_f.size() * 4, cudaMemcpyHostToDevice);
-        core::dsv4_ffn_decode_step(g, cse.layer, w[(size_t) cse.layer], d_in, d_out, cse.token, scratch, nullptr);
+        core::dsv4_ffn_decode_step(g, cse.layer, w[(size_t) cse.layer], d_in, d_out, cse.token, scratch,
+                                   g_stream);
         std::vector<float> out_f(in_f.size());
         cudaMemcpy(out_f.data(), d_out, out_f.size() * 4, cudaMemcpyDeviceToHost);
         cudaFree(d_in);

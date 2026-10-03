@@ -13,10 +13,14 @@
 //   wo_a grouped einsum + wo_b GEMV -> hc_post(attn).
 //
 // The weights arrive as raw device pointers (`Dsv4AttnWeights`): the production resolver fills it
-// from `LayerView`/`WeightRef`, and the parity test fills it with randoms.  Orientations are the
-// manifest's (ne0 contiguous), so every GEMV is `bf16_gemv_fp32_mmvf(x_f32, w_bf16, y_f32)`.
-// `attn_output_a` is the flattened `wo_a`: row `g * o_lora + r` is group g's output r over the
-// group's `heads_per_group * head_dim` slice of `o` - the einsum is one GEMV per group.
+// from `LayerView`/`WeightRef`, and the parity test fills it with ggml-quantized randoms.  The
+// GEMV weights are NATIVE GGUF blocks, not bf16: the real pack skips their canonical bytes and
+// NativeDense serves the shard's own Q5_K/Q8_0 blocks (measured on UD-IQ2_XXS), so the engine
+// quantizes each activation to q8_1 and calls `native_mmvq` with the tensor's GGML type id.
+// `indexer.proj` is the exception the packer left in dense.bin as F32; the resolver converts it to
+// bf16 once at load, so it stays a bf16 GEMV here.  Orientations are the manifest's (ne0
+// contiguous).  `attn_output_a` is the flattened `wo_a`: row `g * o_lora + r` is group g's output r
+// over the group's `heads_per_group * head_dim` slice of `o` - the einsum is one GEMV per group.
 //
 // `scratch` is caller-owned workspace sized by `dsv4_attn_scratch_bytes`; the pools and carries are
 // `Dsv4State` buffers.  `pos` is the absolute position of this token.  Nothing here allocates.
@@ -30,11 +34,12 @@
 namespace strata::core {
 
 struct Dsv4AttnWeights {
-    const uint16_t* q_a = nullptr;    ///< [n_embd, q_lora]
-    const uint16_t* q_b = nullptr;    ///< [q_lora, n_head * head_dim]
-    const uint16_t* kv = nullptr;     ///< [n_embd, head_dim]
-    const uint16_t* out_a = nullptr;  ///< [n_embd, o_groups * o_lora] (flattened wo_a)
-    const uint16_t* out_b = nullptr;  ///< [o_groups * o_lora, n_embd]
+    // native GEMV weights: `<x>_type` is native_mmvq's stable GGML type id, `<x>` raw GGUF blocks.
+    int q_a_type = -1;    const uint8_t* q_a = nullptr;     ///< [n_embd, q_lora]
+    int q_b_type = -1;    const uint8_t* q_b = nullptr;     ///< [q_lora, n_head * head_dim]
+    int kv_type = -1;     const uint8_t* kv = nullptr;      ///< [n_embd, head_dim]
+    int out_a_type = -1;  const uint8_t* out_a = nullptr;   ///< [n_embd, o_groups * o_lora] (flattened wo_a)
+    int out_b_type = -1;  const uint8_t* out_b = nullptr;   ///< [o_groups * o_lora, n_embd]
     const float* norm = nullptr;      ///< attn_norm [n_embd]
     const float* q_a_norm = nullptr;  ///< [q_lora]
     const float* kv_norm = nullptr;   ///< [head_dim]
@@ -43,15 +48,15 @@ struct Dsv4AttnWeights {
     const float* hc_base = nullptr;   ///< [mix_hc]
     const float* hc_scale = nullptr;  ///< [3]
     // compressor, null when ratio == 0
-    const uint16_t* comp_kv = nullptr;    ///< [n_embd, item]
-    const uint16_t* comp_gate = nullptr;  ///< [n_embd, item]
+    int comp_kv_type = -1;    const uint8_t* comp_kv = nullptr;     ///< [n_embd, item]
+    int comp_gate_type = -1;  const uint8_t* comp_gate = nullptr;   ///< [n_embd, item]
     const float* ape = nullptr;           ///< [ratio][item]
     const float* comp_norm = nullptr;     ///< [head_dim]
     // indexer, null unless ratio == 4
-    const uint16_t* idx_qb = nullptr;       ///< [q_lora, idx_q_heads * idx_key_dim]
-    const uint16_t* idx_proj = nullptr;     ///< [n_embd, idx_q_heads]
-    const uint16_t* idx_comp_kv = nullptr;  ///< [n_embd, 2 * idx_key_dim]
-    const uint16_t* idx_comp_gate = nullptr;
+    int idx_qb_type = -1;       const uint8_t* idx_qb = nullptr;       ///< [q_lora, idx_q_heads * idx_key_dim]
+    const uint16_t* idx_proj = nullptr;   ///< [n_embd, idx_q_heads] bf16 (resolver-converted from F32)
+    int idx_comp_kv_type = -1;    const uint8_t* idx_comp_kv = nullptr;    ///< [n_embd, 2 * idx_key_dim]
+    int idx_comp_gate_type = -1;  const uint8_t* idx_comp_gate = nullptr;
     const float* idx_ape = nullptr;  ///< [4][2 * idx_key_dim]
     const float* idx_comp_norm = nullptr;
 };

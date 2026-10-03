@@ -222,9 +222,23 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
        splits one arena between the halves. `dsv4_block_layer_parity` runs four tokens through a
        full r=4 layer and a full r=0+hash layer: the block is BIT-identical to running the two
        parity-tested halves in sequence with separate workspaces, its pools match the sequence's,
-       and the r=4 layer's compressed and indexer pools actually fill. What still blocks a run:
-       the session/generate path that feeds the block the pack's weights (the resolver, and the
-       shared expert's quantized GGUF tensors through the same iq path as the packed ones), and
+       and the r=4 layer's compressed and indexer pools actually fill. *The weight contract is
+       native, not bf16:* the real pack does not serve the attention GEMVs or the shared expert as
+       bf16 - the GGUF keeps them quantized (attn q_a and the shared gate/up are Q5_K, q_b/kv/
+       output_a/output_b and the shared down Q8_0/Q6_K) and `NativeDense` attaches those blobs
+       straight from the shards, so `Dsv4AttnWeights`/`Dsv4FfnWeights` carry a `type` + raw-block
+       pointer per GEMV and both halves run them through `quantize_q8_1_rows` + `native_mmvq`
+       (the same path the Qwen dense layers use; `native_mmvq` needs a real CUDA stream and
+       covers Q3_K..Q6_K/Q8_0 - the IQ2/IQ3 routed experts stay on `iq_mmvq`, and `ffn_gate_inp`
+       stays raw BF16). Two layout facts the switch caught: a quantized row is not `n_in` bytes
+       wide, so the wo_a group offset must be counted in bytes (`native_mmvq_weight_bytes`), and
+       a blob must be quantized with rows = n_out, cols = n_in, because the GEMV reads each
+       output row as one contiguous run. With the reference dequantizing the same blobs, streams
+       match at ~2e-2 and the pools at ~5e-3 - the q8_1 activation rounding, which measures 5e-3
+       per GEMV standalone; the three wrong wirings still come out 0.25-0.4 apart. What still blocks a run:
+       the session/generate path that feeds the block the pack's weights (the resolver, plus a
+       loader for the I32 `tid2eid` tables, which the pack skips and `NativeDense` does not
+       serve), and
        prefill attention.
     The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
     per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above.
