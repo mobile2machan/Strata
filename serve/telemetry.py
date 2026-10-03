@@ -159,17 +159,48 @@ class _Amd:
         except (OSError, ValueError, TypeError):
             return None
 
+    @staticmethod
+    def _speed(path):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                s = f.read()
+            for k, gen in (("64.0", 6), ("32.0", 5), ("16.0", 4), ("8.0", 3), ("5.0", 2), ("2.5", 1)):
+                if k in s:
+                    return gen
+        except (OSError, TypeError):
+            pass
+        return None
+
     def name(self):
         try:
             with open(os.path.join(self.dev, "product_name"), encoding="utf-8") as f:
-                return f.read().strip() or "AMD Radeon"
+                s = f.read().strip()
+                if s:
+                    return s
         except (OSError, TypeError):
-            return "AMD Radeon"
+            pass
+        try:
+            with open(os.path.join(self.dev, "device"), encoding="utf-8") as f:
+                dev_id = f.read().strip().lower()
+            ids = {
+                "0x7550": "AMD Radeon RX 9070 XT",
+                "0x7551": "AMD Radeon RX 9070",
+                "0x744c": "AMD Radeon RX 7900 XTX",
+                "0x7448": "AMD Radeon RX 7900 XT",
+            }
+            if dev_id in ids:
+                return ids[dev_id]
+        except (OSError, TypeError):
+            pass
+        return "AMD Radeon"
 
     def read(self):
         out = {"util": self._int(os.path.join(self.dev, "gpu_busy_percent")),
                "mem_used": self._int(os.path.join(self.dev, "mem_info_vram_used")),
-               "mem_total": self._int(os.path.join(self.dev, "mem_info_vram_total"))}
+               "mem_total": self._int(os.path.join(self.dev, "mem_info_vram_total")),
+               "pcie_width": self._int(os.path.join(self.dev, "current_link_width")),
+               "pcie_gen": self._speed(os.path.join(self.dev, "current_link_speed")),
+               "pcie_gen_max": self._speed(os.path.join(self.dev, "max_link_speed"))}
         if self.hwmon:
             t = self._int(os.path.join(self.hwmon, "temp1_input"))
             out["temp"] = t / 1000.0 if t is not None else None
