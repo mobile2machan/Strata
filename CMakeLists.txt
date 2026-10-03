@@ -385,6 +385,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(dsv4_layout_test PRIVATE strata_engine)
     add_test(NAME dsv4_layout_test COMMAND dsv4_layout_test)
     set_tests_properties(dsv4_layout_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    # the same checks against the real artifact, when this machine has one (docs/DSV4.md).  A test that
+    # silently skips is a test that stops running, so the absence is said at configure time.
+    set(STRATA_DSV4_PACK "" CACHE PATH "a built deepseek4 pack (tools/iq_pack.py) for the real-artifact layout test")
+    set(STRATA_DSV4_SHARD1 "" CACHE PATH "the metadata shard (00001) of the GGUF that pack was built from")
+    if(STRATA_DSV4_PACK AND STRATA_DSV4_SHARD1 AND EXISTS "${STRATA_DSV4_PACK}/experts.bin"
+       AND EXISTS "${STRATA_DSV4_SHARD1}")
+      add_test(NAME dsv4_layout_real
+               COMMAND dsv4_layout_test --real ${STRATA_DSV4_PACK} ${STRATA_DSV4_SHARD1})
+      set_tests_properties(dsv4_layout_real PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    else()
+      message(STATUS "strata: STRATA_DSV4_PACK / STRATA_DSV4_SHARD1 not set - the real deepseek4 layout test is NOT registered")
+    endif()
     # #369: per-layer admission on a sized (native pack) cache starts each layer in its own range
     add_executable(expert_cache_per_layer_test tests/core/expert_cache_per_layer_test.cpp)
     target_link_libraries(expert_cache_per_layer_test PRIVATE strata_engine)

@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -234,13 +235,69 @@ void drop_row(const fs::path& pack, const std::string& name) {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
         std::printf("dsv4_layout_test: no CUDA device, skipped\n");
         return 77;
     }
     TempDir tmp;
+
+    // --real PACK_DIR SHARD1: the same two checks against the real artifact - the geometry out of the
+    // metadata shard, the shape tables over the pack's own index.txt (expert_layout_test's --real mode,
+    // docs/DSV4.md). The skip set is read off the rows themselves: a native row is kind 0 with a
+    // code_bits and no bytes, which is exactly what iq_pack writes for a tensor the GGUF serves.
+    if (argc >= 4 && std::strcmp(argv[1], "--real") == 0) {
+        const fs::path pack = argv[2], shard1 = argv[3];
+        std::printf("real: %s\n", pack.string().c_str());
+        std::string err;
+        ModelGeometry g;
+        {
+            strata::GgufFile f(shard1.string());
+            check(strata::artifact::deepseek4_geometry(f, g, err), "geometry reads from the real metadata shard");
+            if (g.arch != strata::core::ModelArch::DeepSeek4) {
+                std::printf("dsv4_layout_test: real geometry failed\n");
+                return 1;
+            }
+            std::printf("    %lld layers, n_embd %lld, %lld experts, hash %lld, classes:", (long long) g.n_layers,
+                        (long long) g.n_embd, (long long) g.n_expert, (long long) g.dsv4.hash_layers);
+            int n0 = 0, n4 = 0, n128 = 0;
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                int64_t r = strata::core::dsv4_ratio(g, l);
+                if (r == 0) ++n0; else if (r == 4) ++n4; else if (r == 128) ++n128;
+            }
+            std::printf(" %d window / %d r4 / %d r128\n", n0, n4, n128);
+        }
+        std::set<std::string> skip;
+        {
+            std::ifstream idx(pack / "index.txt");
+            std::string line;
+            while (std::getline(idx, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                char name[256] = {0};
+                int file = 0, kind = 0, bits = 0;
+                unsigned long long dummy = 0, dst_bytes = 0;
+                long long ne = 0;
+                if (std::sscanf(line.c_str(), "%255s %d %d %llu %llu %llu %llu %lld %lld %d", name, &file, &kind,
+                                &dummy, &dummy, &dummy, &dst_bytes, &ne, &ne, &bits) != 10)
+                    continue;
+                if (kind == 0 && bits != 0 && dst_bytes == 0) skip.insert(name);
+            }
+        }
+        std::printf("    native rows found in index.txt: %zu\n", skip.size());
+        Loaded ld;
+        uint64_t pool = 0;
+        if (WeightTable::pool_bytes(pack.string(), pool, err, &skip)) {
+            if (cudaMalloc(&ld.arena, (size_t) pool) == cudaSuccess)
+                ld.ok = ld.wt.load(pack.string(), ld.arena, pool, err, &skip);
+        }
+        if (!ld.ok) std::printf("    (load err: %s)\n", err.c_str());
+        check(ld.ok, "the real pack's index.txt loads (dense only; natives skipped)");
+        check(strata::core::check_all(ld.wt, g, err), "check_all passes over every real layer");
+        if (!err.empty()) std::printf("    (err was: %s)\n", err.c_str());
+        std::printf(g_fail ? "dsv4_layout_test: %d FAILED\n" : "dsv4_layout_test: all passed\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
 
     std::printf("1. the geometry reader (synthetic deepseek4 GGUF)\n");
     {

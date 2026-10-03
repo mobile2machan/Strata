@@ -1,9 +1,10 @@
 # DeepSeek-V4-Flash: support plan
 
-Status: **P0 done** (2026-10-03, artifact inspection) and **P1 first step done** (`tools/iq_pack.py` gained a
-`deepseek4` mode + `tools/test_dsv4_pack.py`; the full 91 GB pack has not been built yet). Nothing in the
-engine runs this model yet. Everything marked *measured* below came from the artifact itself; speed
-figures are *estimates* with their reasoning stated, per the docs rule.
+Status: **P0 done** (2026-10-03, artifact inspection), **P1 done** (the real UD-IQ2_XXS pack is built -
+78.11 GiB of experts - and verified end to end) and **P2 first step done** (the geometry reader and the
+shape checks pass against the real artifact; `dsv4_layout_real`). The engine still refuses to LOAD a
+deepseek4 pack - nothing runs this model yet. Everything marked *measured* below came from the artifact
+itself; speed figures are *estimates* with their reasoning stated, per the docs rule.
 
 Why this model: it is the first candidate whose shape matches this engine - linear-window attention with a
 Lightning indexer (the QSA family), a 4-stream residual (the gated-residual plumbing), a 256-expert MoE
@@ -49,8 +50,9 @@ UD-IQ2_XXS quant split (measured across all three shards - the UD recipe **mixes
 | `token_embd`, `output` | Q4_K (kept high) |
 
 Measured file sizes: **UD-IQ2_XXS = 90.9 GB** (3 shards; layers 0-23 in shard 2, 24-42 in shard 3),
-**UD-IQ3_XXS = 104.2 GB** (4 shards), UD-Q4_K_XL = 155.2 GB (5 shards). Experts are ~97% of the bytes,
-which is exactly the part this engine keeps in pinned RAM and streams.
+**UD-IQ3_XXS = 104.2 GB** (4 shards), UD-Q4_K_XL = 155.2 GB (5 shards). The built pack's `experts.bin` is
+**83.9 GB (78.11 GiB)** - 92% of the file - which is exactly the part this engine keeps in pinned RAM and
+streams.
 
 ## The drafter: DSpark, not MTP (measured)
 
@@ -74,7 +76,7 @@ streaming path rather than sit in VRAM.
 | machine | default quant | fit |
 |---|---|---|
 | Windows, 137 GB RAM, 24 GB NVIDIA | UD-IQ3_XXS (104.2 GB) | experts ~101 GB pinned + KV + OS ~ 115-120 GB; ~17 GB headroom |
-| Linux, 128 GB RAM, RX 9070 XT (gfx1201), Ryzen 7 5700X | UD-IQ2_XXS (90.9 GB) | experts ~88 GB pinned ~ 100-105 GB; ~25 GB headroom. gfx1201 is a validated Strata backend (`docs/AMD_HIP.md`) |
+| Linux, 128 GB RAM, RX 9070 XT (gfx1201), Ryzen 7 5700X | UD-IQ2_XXS (90.9 GB) | experts 83.9 GB (measured `experts.bin`) pinned ~ 95-100 GB; ~28 GB headroom. gfx1201 is a validated Strata backend (`docs/AMD_HIP.md`) |
 
 Speed estimates (not measurements - to be replaced by real numbers at P4): the 5700X box has DDR4-3200
 (~42 GB/s effective), and at ~10% expert-cache hit the CPU GEMV path moves ~1.7 GB of expert bytes per
@@ -84,13 +86,14 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
 
 ## Implementation phases
 
-- **P1 - pack.** *First step done:* `tools/iq_pack.py` reads `general.architecture = deepseek4` and packs it:
+- **P1 - pack.** *Done.* `tools/iq_pack.py` reads `general.architecture = deepseek4` and packs it:
   experts stay native (the per-layer `gu_type/d_type` columns of `native_experts.txt` already carry mixed
   types), dense floats are written as stored (no FORM conversions), quantized projections and the I32 hash
   tables are served natively, and `model.json` records the geometry for P2. `tools/test_dsv4_pack.py` builds
   a two-shard deepseek4 fixture (metadata-only shard 1, a hash layer beside a routed layer, IQ2_XXS/IQ3_XXS
-  experts) and checks the arena is the source bytes relaid per expert. Remaining: build the real 91 GB pack
-  and verify it end to end.
+  experts) and checks the arena is the source bytes relaid per expert. The real UD-IQ2_XXS pack is built
+  (43 layers, `experts.bin` 78.11 GiB, 1199 index rows of which 494 are served natively) and verified
+  end to end by `dsv4_layout_real` below.
 - **P2 - engine.** *First step done:* the geometry reader and the shape checks. `include/strata/artifact/
   dsv4_geometry.hpp` fills a `ModelGeometry` (`arch = DeepSeek4`, a `Dsv4` block for the numbers Qwen does
   not have) from the artifact's own `deepseek4.*` metadata, refusing a missing or implausible key by name;
@@ -98,8 +101,11 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
   the UD-IQ2_XXS tensor directory, including the two compressor widths (2x key for r=4, key for r=128), the
   mHC widths (6*hc, hc-1), the per-class presence rules (indexer only on r=4 layers) and the hash layers'
   `tid2eid` beside a missing `exp_probs_b`. `tests/core/dsv4_layout_test.cpp` reads a synthetic GGUF and
-  checks a synthetic pack covering all four fixture classes, plus the five named negatives. The engine still
-  refuses to LOAD a deepseek4 pack (`check_architecture` is untouched) - that wiring is the next step.
+  checks a synthetic pack covering all four fixture classes, plus the five named negatives; its `--real
+  PACK SHARD1` mode (`dsv4_layout_real`, registered when `STRATA_DSV4_PACK`/`STRATA_DSV4_SHARD1` point at
+  one) reads the real metadata shard - 43 layers, 2 window / 21 r=4 / 20 r=128, 3 hash - and passes
+  `check_all` over the real pack's own index.txt. The engine still refuses to LOAD a deepseek4 pack
+  (`check_architecture` is untouched) - that wiring is the next step.
   The new math, in order of risk: the Compressor (gated pooling + APE + ring state,
   overlapping variant) and the tiered KV pool (window 128 + compressed entries + sinks); the indexer scoring
   compressed entries (the QSA stack is the base); mHC Sinkhorn mixing (the GR plumbing is the base);
