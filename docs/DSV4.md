@@ -263,8 +263,14 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
         called at exactly that point, and `Dsv4Forward` stages the six picked blobs (45 MB)
         instead of the layer's 1.8 GiB region. Measured: the eight-position smoke run went from
         ~10 minutes to ~60 seconds on the 3090 (a decode step is now ~2-3 s, still dominated
-        by cold random reads); the staged and full-region paths give bit-identical logits.
-        What still blocks a usable run: prefill attention and the tokenizer.
+        by cold random reads); the staged and full-region paths give bit-identical logits. *The
+        prefill gather done:* `dsv4_attn_prefill` (same file as the decode gather) runs `n`
+        queries in one launch, each with its own window/compressed id lists - the causal window
+        and the per-query indexer picks are the caller's, the kernel just gathers, one block per
+        (query, head). Parity: every prefill row matches the decode kernel's reference given the
+        same lists (rel 1.3e-7), and a query given its neighbour's list is 0.66 away. What
+        still blocks a usable run: the batched prefill engine around that kernel (the block's
+        GEMVs, router and experts at n tokens instead of 1) and the tokenizer.
     The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
     per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above.
     (The MXFP4 expert GEMV, the attention sinks, the mHC Sinkhorn mixing, the sqrtsoftplus/`tid2eid`

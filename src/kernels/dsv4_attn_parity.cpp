@@ -152,6 +152,88 @@ void run_case(int64_t n_heads, int64_t d, int64_t n_win, int64_t n_cmp, bool wit
     if (d_sink) cudaFree(d_sink);
 }
 
+// The prefill shape: n queries, each with its own causal window list and its own cmp list.  The
+// oracle is the decode kernel's own reference run once per query with that query's lists - the
+// two kernels must agree exactly, and a query that got its neighbour's list must not.
+void run_prefill_case(int64_t n, int64_t n_heads, int64_t d, int64_t n_win, int64_t n_cmp,
+                      uint32_t seed, int& bad) {
+    std::printf("  prefill n %lld heads %lld d %lld win %lld cmp %lld\n", (long long) n,
+                (long long) n_heads, (long long) d, (long long) n_win, (long long) n_cmp);
+    const int64_t wcap = n_win, cmp_cap = n_cmp > 0 ? n_cmp : 1;
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    std::vector<float> q((size_t) n * n_heads * d), sinks((size_t) n_heads);
+    std::vector<uint16_t> win((size_t) wcap * d), cmp((size_t) cmp_cap * d);
+    for (auto& v : q) v = g(rng);
+    for (auto& v : sinks) v = g(rng);
+    for (auto& v : win) v = bf16_from_f32(g(rng));
+    for (auto& v : cmp) v = bf16_from_f32(g(rng));
+    std::vector<int32_t> win_ids((size_t) n * n_win, -1), cmp_ids((size_t) n * n_cmp, -1);
+    for (int64_t t = 0; t < n; ++t) {
+        for (int64_t i = 0; i <= t && i < n_win; ++i) win_ids[(size_t) t * n_win + i] = (int32_t) i;
+        const int64_t valid = (t + 1) / 4;
+        for (int64_t i = 0; i < valid && i < n_cmp; ++i) cmp_ids[(size_t) t * n_cmp + i] = (int32_t) i;
+    }
+    const float scale = 1.0f / std::sqrt((float) d);
+
+    float *d_q = nullptr, *d_o = nullptr, *d_sink = nullptr;
+    uint16_t *d_win = nullptr, *d_cmp = nullptr;
+    int32_t *d_wid = nullptr, *d_cid = nullptr;
+    check(cudaMalloc(&d_q, q.size() * 4), "pq");
+    check(cudaMalloc(&d_o, q.size() * 4), "po");
+    check(cudaMalloc(&d_win, win.size() * 2), "pwin");
+    check(cudaMalloc(&d_cmp, cmp.size() * 2), "pcmp");
+    check(cudaMalloc(&d_wid, win_ids.size() * 4), "pwid");
+    check(cudaMalloc(&d_cid, cmp_ids.size() * 4), "pcid");
+    check(cudaMalloc(&d_sink, sinks.size() * 4), "psink");
+    check(cudaMemcpy(d_q, q.data(), q.size() * 4, cudaMemcpyHostToDevice), "pmq");
+    check(cudaMemcpy(d_win, win.data(), win.size() * 2, cudaMemcpyHostToDevice), "pmwin");
+    check(cudaMemcpy(d_cmp, cmp.data(), cmp.size() * 2, cudaMemcpyHostToDevice), "pmcmp");
+    check(cudaMemcpy(d_wid, win_ids.data(), win_ids.size() * 4, cudaMemcpyHostToDevice), "pmwid");
+    check(cudaMemcpy(d_cid, cmp_ids.data(), cmp_ids.size() * 4, cudaMemcpyHostToDevice), "pmcid");
+    check(cudaMemcpy(d_sink, sinks.data(), sinks.size() * 4, cudaMemcpyHostToDevice), "pmsink");
+
+    strata::kernels::Dsv4AttnPools pools;
+    pools.window = d_win;
+    pools.cmp = d_cmp;
+    strata::kernels::dsv4_attn_prefill(d_q, d_wid, n_win, d_cid, n_cmp, d_sink, scale, pools, wcap, n,
+                                       n_heads, d, d_o, nullptr);
+    std::vector<float> got(q.size());
+    check(cudaMemcpy(got.data(), d_o, got.size() * 4, cudaMemcpyDeviceToHost), "pgo");
+
+    double worst = 0, shifted = 0;
+    for (int64_t t = 0; t < n; ++t) {
+        std::vector<float> qt(q.begin() + (size_t) t * n_heads * d,
+                             q.begin() + (size_t) (t + 1) * n_heads * d);
+        std::vector<int32_t> w(win_ids.begin() + (size_t) t * n_win,
+                               win_ids.begin() + (size_t) (t + 1) * n_win);
+        std::vector<int32_t> c(cmp_ids.begin() + (size_t) t * n_cmp,
+                               cmp_ids.begin() + (size_t) (t + 1) * n_cmp);
+        std::vector<double> want;
+        ref_attn(n_heads, d, qt, win, cmp, w, c, &sinks, scale, want);
+        std::vector<double> gd(got.begin() + (size_t) t * n_heads * d,
+                               got.begin() + (size_t) (t + 1) * n_heads * d);
+        worst = std::max(worst, rel_l1(want, gd));
+        if (t + 1 < n) {  // the neighbour's list must be observably different
+            std::vector<double> w2;
+            ref_attn(n_heads, d, qt, win, cmp,
+                     std::vector<int32_t>(win_ids.begin() + (size_t) (t + 1) * n_win,
+                                          win_ids.begin() + (size_t) (t + 2) * n_win),
+                     std::vector<int32_t>(cmp_ids.begin() + (size_t) (t + 1) * n_cmp,
+                                          cmp_ids.begin() + (size_t) (t + 2) * n_cmp),
+                     &sinks, scale, w2);
+            shifted = std::max(shifted, rel_l1(w2, gd));
+        }
+    }
+    std::printf("    %-46s rel %.3e, neighbour-list %.2e\n", "per-query rows vs the reference", worst,
+                shifted);
+    if (!(worst <= 1e-5)) { std::printf("      *** over 1e-5 ***\n"); ++bad; }
+    if (!(shifted > 1e-3)) { std::printf("      *** a swapped list is not observable ***\n"); ++bad; }
+
+    cudaFree(d_q); cudaFree(d_o); cudaFree(d_win); cudaFree(d_cmp);
+    cudaFree(d_wid); cudaFree(d_cid); cudaFree(d_sink);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -164,6 +246,7 @@ int main(int argc, char** argv) {
     run_case(64, 512, 128, 64, true, 21, bad);   // r=128 layer: full window + all valid blocks
     run_case(64, 512, 128, 0, true, 22, bad);     // window-only layer
     run_case(64, 512, 128, 16, false, 23, bad);   // no-sink path (sinks null)
+    run_prefill_case(8, 8, 512, 8, 4, 24, bad);   // prefill: causal per-query lists
     std::printf("dsv4_attn_parity: %s\n", bad ? "*** FAIL ***" : "ok");
     return bad ? 1 : 0;
 }
