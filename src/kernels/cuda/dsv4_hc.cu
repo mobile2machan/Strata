@@ -101,6 +101,35 @@ __global__ void hc_post_combine_kernel(const float* __restrict__ a, const float*
     }
 }
 
+// model.py::hc_pre mixes: F.linear(x, fn) * rsqrt(mean(x^2) + eps).  One block per (token, output
+// row); the block reads x twice (dot + sumsq) - n_out is 24, the redundancy is noise next to the
+// GEMVs around it.
+__global__ void hc_mixes_kernel(const float* __restrict__ x, const float* __restrict__ fn,
+                                float* __restrict__ mixes, int64_t n_in, int64_t n_out, float eps) {
+    const int64_t m = blockIdx.x;
+    const int o = blockIdx.y;
+    const float* xr = x + m * n_in;
+    const float* wr = fn + o * n_in;
+    float dot = 0.0f, sq = 0.0f;
+    for (int64_t i = threadIdx.x; i < n_in; i += blockDim.x) {
+        dot += xr[i] * wr[i];
+        sq += xr[i] * xr[i];
+    }
+    __shared__ float red[16];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    for (int off = 16; off > 0; off >>= 1) {
+        dot += __shfl_down_sync(0xFFFFFFFFu, dot, off);
+        sq += __shfl_down_sync(0xFFFFFFFFu, sq, off);
+    }
+    if (lane == 0) { red[warp] = dot; red[8 + warp] = sq; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int nw = (int) blockDim.x / 32;
+        for (int w = 1; w < nw; ++w) { dot += red[w]; sq += red[8 + w]; }
+        mixes[m * n_out + o] = dot * rsqrtf(sq / (float) n_in + eps);
+    }
+}
+
 }  // namespace
 
 void hc_split_sinkhorn(const float* mixes, const float* scale, const float* base, int64_t n, int64_t hc,
@@ -109,6 +138,14 @@ void hc_split_sinkhorn(const float* mixes, const float* scale, const float* base
                                                                             (int) iters, eps, pre, post, comb);
     check_launch("hc_split_sinkhorn");
     sync_if_needed(stream, "hc_split_sinkhorn");
+}
+
+void hc_mixes(const float* x, const float* fn, float* mixes, int64_t n, int64_t n_in, int64_t n_out,
+              float eps, void* stream) {
+    hc_mixes_kernel<<<dim3((unsigned) n, (unsigned) n_out), 256, 0, (cudaStream_t) stream>>>(
+        x, fn, mixes, n_in, n_out, eps);
+    check_launch("hc_mixes");
+    sync_if_needed(stream, "hc_mixes");
 }
 
 void hc_pre_combine(const float* x, const float* pre, float* y, int64_t m, int64_t hc, int64_t d,

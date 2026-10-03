@@ -32,6 +32,13 @@ namespace strata::kernels {
 void hc_split_sinkhorn(const float* mixes, const float* scale, const float* base, int64_t n, int64_t hc,
                        int64_t iters, float eps, float* pre, float* post, float* comb, void* stream);
 
+/// `mixes[m][o] = dot(fn[o], x[m]) * rsqrt(mean(x[m]^2) + eps)` - the `model.py::hc_pre` mixes
+/// projection (`F.linear(flatten(stream), hc_fn)` times the stream RMS factor).  `fn` is
+/// `[n_out][n_in]` f32 (the checkpoint form), x `[n_in]` per token.  One block per output row;
+/// each block reads x twice (dot + sumsq) - n_out is 24, the redundancy is noise.
+void hc_mixes(const float* x, const float* fn, float* mixes, int64_t n, int64_t n_in, int64_t n_out,
+              float eps, void* stream);
+
 /// `y[m][d] = sum_h pre[m][h] * x[m][h][d]`.
 void hc_pre_combine(const float* x, const float* pre, float* y, int64_t m, int64_t hc, int64_t d,
                     void* stream);

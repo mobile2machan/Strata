@@ -74,6 +74,17 @@ struct ModelGeometry {
         int64_t hash_layers = 3;       ///< layers 0..hash_layers-1 route through tid2eid instead of a router
         int64_t sinkhorn_iters = 20;   ///< mHC mixing, `hyper_connection.sinkhorn_iterations`
         float hc_eps = 1e-6f;          ///< `hyper_connection.epsilon`, the split/Sinkhorn epsilon
+        float norm_eps = 1e-6f;        ///< `attention.layer_norm_rms_epsilon`, every RMSNorm
+        /// The two rope regimes (`attention.py::__init__`): attention uses `rope.freq_base` with
+        /// YaRN only on compressed layers; the compressor/indexer use `compress_rope_freq_base`
+        /// with YaRN always.  `rope_dim` is `rope.dimension_count` (the last dims that rotate).
+        double rope_theta = 10000.0;
+        double compress_rope_theta = 160000.0;
+        int64_t rope_dim = 64;
+        double yarn_factor = 16.0;
+        int64_t yarn_orig = 65536;
+        int64_t yarn_beta_fast = 32;
+        int64_t yarn_beta_slow = 1;
         int64_t gating_func = 4;       ///< `expert_gating_func`; measured 4 = sqrtsoftplus, the only one implemented
         float route_scale = 1.5f;      ///< `expert_weights_scale`, multiplied onto the renormalized top-k weights
         bool weights_norm = true;      ///< `expert_weights_norm`, renormalize the top-k weights to sum 1

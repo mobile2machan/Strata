@@ -189,8 +189,23 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
       for one contiguous sequence - the register IS the carry); `dsv4_state_test` checks the sizing
       arithmetic per layer class, the arena's pointer contract, and the ring/`valid` addressing.
       `dsv4_indexer_select` picks the top-k blocks by score (ties to the lower index, -inf never
-      picked, -1 padding) and its picks match a sort reference exactly. What still blocks a run: the
-      layer wiring that drives these kernels, and the session/generate path around it.
+      picked, -1 padding) and its picks match a sort reference exactly. *Attention-half wiring done:*
+      `hc_mixes` (the mHC pre's GEMV + RMS factor) plus `core/dsv4_attn.cpp` wire one decode token
+      end to end through an r=4 layer - mHC pre, attn_norm, the LoRA-split Q with per-head norms,
+      the single kv head into the window ring, the compressor decode into the cmp pool, the indexer
+      (q rope + Hadamard + e2m1, weights with the folded scale, its own compressor into the idx
+      pool, logits, top-k), the tiered gather with the sink, the inverse rope, the grouped `wo_a`
+      einsum as one GEMV per group over the flattened weight, `wo_b`, mHC post. The rope/norm
+      constants (both thetas, YaRN, `rope.dimension_count`, `layer_norm_rms_epsilon`) are now read
+      from the artifact instead of being hardcoded. `dsv4_attn_layer_parity` runs eight consecutive
+      tokens - crossing a compressor block boundary at token 3 and reaching two scored indexer rows
+      at token 7 - at the real dimensions, against a float64 transcription of the reference decode
+      path; the quantization round-trips and the Hadamard are the only parts the reference borrows
+      from the GPU kernels (they are parity-tested on their own), so what is under test is the
+      wiring. Streams match at ~2e-7 (1e-4 at the token where a quantization boundary rounds
+      differently), the three pools match, and no-sink / window-only / no-top-k come out 0.25-0.4
+      apart. What still blocks a run: the FFN half of the block (the router and expert path exist,
+      unwired), and the session/generate path around both.
     The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
     per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above.
     (The MXFP4 expert GEMV, the attention sinks, the mHC Sinkhorn mixing, the sqrtsoftplus/`tid2eid`

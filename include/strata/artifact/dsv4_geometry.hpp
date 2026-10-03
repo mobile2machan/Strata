@@ -103,6 +103,30 @@ inline bool deepseek4_geometry(const GgufFile& f, core::ModelGeometry& g, std::s
     if (!pos("deepseek4.attention.indexer.key_length", m.idx_key_dim)) return false;
     if (!pos("deepseek4.attention.indexer.top_k", m.dsv4.idx_topk)) return false;
 
+    // The norms and the two rope regimes.  All measured on the artifact: eps 1e-6, theta 1e4 /
+    // 1.6e5, rope_dim 64, YaRN factor 16 over an original context of 65536, betas 32/1.
+    double eps_v = 0, theta = 0, ctheta = 0, yfactor = 0, bfast = 0, bslow = 0;
+    if (!dnum("deepseek4.attention.layer_norm_rms_epsilon", eps_v)) return false;
+    if (eps_v <= 0) { err = "layer_norm_rms_epsilon is not positive"; return false; }
+    m.dsv4.norm_eps = (float) eps_v;
+    if (!dnum("deepseek4.rope.freq_base", theta)) return false;
+    if (theta <= 1.0) { err = "rope.freq_base is not above 1"; return false; }
+    m.dsv4.rope_theta = theta;
+    if (!pos("deepseek4.rope.dimension_count", m.dsv4.rope_dim)) return false;
+    if (m.dsv4.rope_dim % 2 != 0 || m.dsv4.rope_dim > m.head_dim) {
+        err = "rope.dimension_count " + std::to_string(m.dsv4.rope_dim) + " is not a valid even part of key_length";
+        return false;
+    }
+    if (!dnum("deepseek4.rope.scaling.factor", yfactor)) return false;
+    if (!num("deepseek4.rope.scaling.original_context_length", m.dsv4.yarn_orig)) return false;
+    if (!dnum("deepseek4.rope.scaling.yarn_beta_fast", bfast)) return false;
+    if (!dnum("deepseek4.rope.scaling.yarn_beta_slow", bslow)) return false;
+    m.dsv4.yarn_factor = yfactor;
+    m.dsv4.yarn_beta_fast = (int64_t) bfast;
+    m.dsv4.yarn_beta_slow = (int64_t) bslow;
+    if (!dnum("deepseek4.attention.compress_rope_freq_base", ctheta)) return false;
+    m.dsv4.compress_rope_theta = ctheta;
+
     auto it = meta.find("deepseek4.attention.compress_ratios");
     if (it == meta.end() || it->second.type != MetaType::ARRAY) { err = "missing deepseek4.attention.compress_ratios"; return false; }
     if ((int64_t) it->second.count < m.n_layers) {
