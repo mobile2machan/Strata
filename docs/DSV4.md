@@ -1,8 +1,8 @@
 # DeepSeek-V4-Flash: support plan
 
-Status: **P0 (artifact inspection) done** on 2026-10-03, against `unsloth/DeepSeek-V4-Flash-0731-GGUF`
-(UD-IQ2_XXS shard headers, fetched by HTTP range, parsed with `tools/gguf_reader.py`). Nothing in the engine
-or the packer runs this model yet. Everything marked *measured* below came from the artifact itself; speed
+Status: **P0 done** (2026-10-03, artifact inspection) and **P1 first step done** (`tools/iq_pack.py` gained a
+`deepseek4` mode + `tools/test_dsv4_pack.py`; the full 91 GB pack has not been built yet). Nothing in the
+engine runs this model yet. Everything marked *measured* below came from the artifact itself; speed
 figures are *estimates* with their reasoning stated, per the docs rule.
 
 Why this model: it is the first candidate whose shape matches this engine - linear-window attention with a
@@ -21,7 +21,7 @@ of VRAM.
 | Compressor | learned gated pooling of KV over `ratio` tokens with per-position APE; the 4:1 compressor is *overlapping* (its APE is `(1024, 4)` = 2x head_dim wide, matching `compress.py`'s `overlap = ratio == 4`); the indexer selects among compressed entries, `indexer.top_k = 512`, 64 heads x 128 |
 | Residual | mHC: `hyper_connection.count = 4`, `sinkhorn_iterations = 20`, per-layer `hc_attn_*`/`hc_ffn_*` tensors, plus `output_hc_*` at the head |
 | MoE | 256 experts, top-6 + 1 shared, `expert_feed_forward_length = 2048`, `expert_gating_func = 4` (sqrtsoftplus), `expert_weights_scale = 1.5`, `exp_probs_b` correction bias, `swiglu_clamp_exp/shexp = 10.0` on all 43 layers |
-| Hash layers | `hash_layer_count = 3`: layers 0-2 have no router at all; they carry `ffn_gate_tid2eid` (I32, `(6, 129280)`) - a static token-id -> 6-expert-ids table |
+| Hash layers | `hash_layer_count = 3`: layers 0-2 additionally carry `ffn_gate_tid2eid` (I32, `(6, 129280)`) - a static token-id -> 6-expert-ids table. Measured: those layers keep their router tensors too; which path the engine uses is a P2 decision |
 | RoPE | YaRN (`factor = 16`, `original_context_length = 65536`, betas 32/1), `compress_rope_freq_base = 160000` for compressed entries |
 | Context | 1,048,576 |
 | Tokenizer | `tokenizer.ggml.model = gpt2` (byte-level BPE, same machinery as Qwen here), `tokenizer.ggml.pre = joyai-llm` (a new pre-tokenizer regex + special tokens only) |
@@ -35,22 +35,22 @@ unknown (the drafter is a separate file); the packer must carry the array verbat
 tensors)**; tensors live in shards 2+. Each shard's tensor-info section lists only its own tensors, so the
 name map below (shard 2, layers 0-23) is the llama.cpp naming contract; later shards repeat it.
 
-UD-IQ2_XXS quant split (measured from the tensor info):
+UD-IQ2_XXS quant split (measured across all three shards - the UD recipe **mixes types per layer**):
 
 | tensors | type |
 |---|---|
-| `blk.N.ffn_gate_exps/up_exps` (4096x2048x256) | IQ2_XXS |
-| `blk.N.ffn_down_exps` | IQ3_XXS (asymmetric - the UD recipe keeps `down` one tier up) |
+| `blk.N.ffn_gate_exps/up_exps` (4096x2048x256) | IQ2_XXS or IQ2_S, per layer |
+| `blk.N.ffn_down_exps` | IQ3_XXS or **MXFP4**, per layer - three (gu, d) combinations measured: (IQ2_XXS, IQ3_XXS), (IQ2_XXS, MXFP4), (IQ2_S, MXFP4); expert blobs are 7.5-9.8 MB |
 | `blk.N.ffn_gate_shexp` (Q5_K), `ffn_up/down_shexp` (Q5_K/Q6_K) | shared expert, K-quants |
-| `blk.N.ffn_gate_inp` | BF16 router; `exp_probs_b` F32; `ffn_gate_tid2eid` I32 |
+| `blk.N.ffn_gate_inp` | BF16 router (all 43 layers); `exp_probs_b` F32 on the 40 routed layers; `ffn_gate_tid2eid` I32 on the 3 hash layers |
 | `attn_q_a` Q5_K, `attn_q_b/attn_kv/attn_output_a/attn_output_b` Q8_0, norms/sinks/ape F32 | attention |
 | `attn_compressor_gate/kv`, `indexer_compressor_gate/kv` Q8_0; `*_ape` F32 | compressors |
 | `hc_attn/ffn_base/fn/scale`, `output_hc_*` | F32 |
 | `token_embd`, `output` | Q4_K (kept high) |
 
-Measured file sizes: **UD-IQ2_XXS = 90.9 GB** (3 shards), **UD-IQ3_XXS = 104.2 GB** (4 shards),
-UD-Q4_K_XL = 155.2 GB (5 shards). Experts are ~97% of the bytes, which is exactly the part this engine
-keeps in pinned RAM and streams.
+Measured file sizes: **UD-IQ2_XXS = 90.9 GB** (3 shards; layers 0-23 in shard 2, 24-42 in shard 3),
+**UD-IQ3_XXS = 104.2 GB** (4 shards), UD-Q4_K_XL = 155.2 GB (5 shards). Experts are ~97% of the bytes,
+which is exactly the part this engine keeps in pinned RAM and streams.
 
 ## The drafter: DSpark, not MTP (measured)
 
@@ -84,16 +84,19 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
 
 ## Implementation phases
 
-- **P1 - pack.** A `deepseek4` layout in `tools/strata_pack.py`/`pack_layer.py`: expert blobs
-  (4096x2048x3, IQ2_XXS/IQ3_XXS - IQ3_XXS already runs here, IQ2_XXS is the same family and needs a parity
-  check), the K-quant non-experts re-encoded to the S4/S8 forms (the UD-Q4_K_XL path already does this for
-  Q4_K), compressor/indexer/mHC/sink tensors, the `tid2eid` hash tables, and the dspark sidecar (its MXFP4
-  experts re-encoded to S4 unless a native path is added). `ModelGeometry` (include/strata/core/layout.hpp)
-  gains a second, data-driven geometry: `layer_types`/`compress_ratios` arrays, indexer dims, hc dims.
+- **P1 - pack.** *First step done:* `tools/iq_pack.py` reads `general.architecture = deepseek4` and packs it:
+  experts stay native (the per-layer `gu_type/d_type` columns of `native_experts.txt` already carry mixed
+  types), dense floats are written as stored (no FORM conversions), quantized projections and the I32 hash
+  tables are served natively, and `model.json` records the geometry for P2. `tools/test_dsv4_pack.py` builds
+  a two-shard deepseek4 fixture (metadata-only shard 1, a hash layer beside a routed layer, IQ2_XXS/IQ3_XXS
+  experts) and checks the arena is the source bytes relaid per expert. Remaining: build the real 91 GB pack
+  and verify it end to end.
 - **P2 - engine.** The new math, in order of risk: the Compressor (gated pooling + APE + ring state,
   overlapping variant) and the tiered KV pool (window 128 + compressed entries + sinks); the indexer scoring
   compressed entries (the QSA stack is the base); mHC Sinkhorn mixing (the GR plumbing is the base);
-  sqrtsoftplus router + `tid2eid` static routing; swiglu clamp; attention sinks.
+  sqrtsoftplus router + `tid2eid` static routing; swiglu clamp; attention sinks; and an **MXFP4 expert
+  GEMV** - the UD-IQ2_XXS file puts MXFP4 in some layers' `down`, and no Strata kernel reads MXFP4 yet
+  (the block format is simple: 32 nibbles + one E8M0 scale).
 - **P3 - around it.** Tokenizer pre-tokenizer `joyai-llm` + special tokens (the BPE core is already
   shared); chat template and the three thinking modes in `serve/`; a `dsv4` family in `setup.py` with the
   per-machine defaults above.

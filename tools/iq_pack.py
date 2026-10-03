@@ -89,6 +89,12 @@ FORM = {
 NATIVE_PLE_KEY = {"Q2_0", "Q8_0"}
 KIND = {"BF16": "4", "F16": "5", "F32": "2"}
 
+# deepseek4 (DeepSeek-V4-Flash, docs/DSV4.md): the GGUF already stores every dense tensor in the form the
+# engine reads it (norms, compressor APE and mHC as F32; routers as BF16), there is no PLE table, and every
+# quantized projection - plus the I32 hash tables (ffn_gate_tid2eid) - is served natively from the GGUF.
+# Nothing is converted, so FORM stays empty; main() swaps the tables in when the shard says deepseek4.
+DSV4_ARCH = "deepseek4"
+
 
 def form_of(name: str):
     return FORM.get(re.sub(r"^blk\.\d+\.", "", name))
@@ -436,9 +442,16 @@ def expert_layout(model: Model, src: pathlib.Path):
     if not exps:
         return "the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)"
     n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
-    n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])   # router rows = experts kept (pruned models ship < 512)
-    if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in range(n_layers)):
-        return "the routers disagree on the expert count; a per-layer pruned model cannot be packed"
+    # The expert count comes from the expert tensors themselves: deepseek4's hash layers (docs/DSV4.md)
+    # carry no router at all. Where a router exists it must agree (pruned Qwen models ship < 512).
+    gate0 = T.get("blk.0.ffn_gate_exps.weight")
+    if gate0 is None or len(gate0.shape) != 3:
+        return "blk.0.ffn_gate_exps.weight is missing or is not [in, out, experts]"
+    n_expert = int(gate0.shape[2])
+    for l in range(n_layers):
+        r = T.get("blk.%d.ffn_gate_inp.weight" % l)
+        if r is not None and int(r.shape[1]) != n_expert:
+            return "the routers disagree on the expert count; a per-layer pruned model cannot be packed"
     layout, lines, offset, n_split = [], [], 0, 0
     for l in range(n_layers):
         names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
@@ -512,6 +525,12 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     g = G.GGUFFile(src)
+    arch = str(g.metadata.get("general.architecture", ""))
+    if arch == DSV4_ARCH:
+        global FORM, NOT_IN_PACK, NATIVE_PLE_KEY
+        FORM, NOT_IN_PACK, NATIVE_PLE_KEY = {}, set(), set()
+        if a.base:
+            ap.error("--base is the Q2_0 Qwen pack; deepseek4 has no canonical base to reuse")
     mm = np.memmap(src, dtype=np.uint8, mode="r")
     model = Model(src)
     if len(model.paths) > 1:
@@ -562,9 +581,23 @@ def main() -> int:
         rc = index_standalone(src, out, model, a.compat_bf16)
     if rc:
         return rc
-    if not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
+    if arch == DSV4_ARCH:
+        # the deepseek4 tokenizer (pre = joyai-llm) is docs/DSV4.md P3; the pack itself is complete without it
+        print("tokenizer: not exported for deepseek4 yet (docs/DSV4.md P3)")
+    elif not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
         subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
                        check=True)   # writes <out>/tokenizer/
+
+    if arch == DSV4_ARCH:
+        # the geometry the engine's deepseek4 reader (docs/DSV4.md P2) needs, from shard 1's metadata;
+        # the heavy tokenizer arrays belong to P3 and are left out
+        heavy = {"tokenizer.ggml.tokens", "tokenizer.ggml.scores", "tokenizer.ggml.merges",
+                 "tokenizer.ggml.token_type", "tokenizer.chat_template", "tokenizer.ggml.added_tokens",
+                 "tokenizer.ggml.pre"}
+        meta = {k: v for k, v in g.metadata.items() if k not in heavy}
+        (out / "model.json").write_text(json.dumps({"architecture": arch, "metadata": meta}, indent=1) + "\n",
+                                        encoding="utf-8")
+        print("model.json: %d metadata keys (heavy tokenizer arrays left out)" % len(meta))
 
     # ---- the experts.  native_experts.txt is written to a temporary name and renamed only when every layer is
     # in: a stop part-way (a layer split across shards, #171) left a partial native_experts.txt that the next setup
