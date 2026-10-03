@@ -357,7 +357,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/dsv4_state.cpp src/core/dsv4_attn.cpp src/core/dsv4_ffn.cpp)
+      src/core/dsv4_state.cpp src/core/dsv4_attn.cpp src/core/dsv4_ffn.cpp src/core/dsv4_block.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
@@ -407,8 +407,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # expert, and the pack's native expert blobs through iq_mmvq - against a float64 transcription.
     add_executable(dsv4_ffn_layer_parity tests/core/dsv4_ffn_layer_parity.cpp)
     target_link_libraries(dsv4_ffn_layer_parity PRIVATE strata_engine strata_artifact strata_kernels_cpu)
-    add_test(NAME dsv4_ffn_layer_parity COMMAND dsv4_ffn_layer_parity --selftest)
-    set_tests_properties(dsv4_ffn_layer_parity PROPERTIES TIMEOUT 600)
+add_test(NAME dsv4_ffn_layer_parity COMMAND dsv4_ffn_layer_parity --selftest)
+set_tests_properties(dsv4_ffn_layer_parity PROPERTIES TIMEOUT 600)
+add_executable(dsv4_block_layer_parity tests/core/dsv4_block_layer_parity.cpp)
+target_link_libraries(dsv4_block_layer_parity PRIVATE strata_engine strata_artifact strata_kernels_cpu)
+add_test(NAME dsv4_block_layer_parity COMMAND dsv4_block_layer_parity --selftest)
+set_tests_properties(dsv4_block_layer_parity PROPERTIES TIMEOUT 600)
     # the same checks against the real artifact, when this machine has one (docs/DSV4.md).  A test that
     # silently skips is a test that stops running, so the absence is said at configure time.
     set(STRATA_DSV4_PACK "" CACHE PATH "a built deepseek4 pack (tools/iq_pack.py) for the real-artifact layout test")

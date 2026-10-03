@@ -216,8 +216,16 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
       on the engine's own fp32, which is the pipeline, not the wiring), and dropping the route
       scale, gathering weights from the post-bias scores, or dropping the SwiGLU clamp come out
       observably apart. One layout fact the test caught: the CUDA `block_q8_1` is `half2 ds
-      (d, sum) + qs[32]` - 36 bytes, not the CPU's 34. What still blocks a run: the session/
-      generate path that joins the two halves and feeds them the pack's weights.
+       (d, sum) + qs[32]` - 36 bytes, not the CPU's 34. *The join done:* `core/dsv4_block.cpp`
+       puts the two halves in the reference's order with one hazard handled - `hc_post_combine`
+       reads its residual while writing, so the block stages the hand-off in its own buffer and
+       splits one arena between the halves. `dsv4_block_layer_parity` runs four tokens through a
+       full r=4 layer and a full r=0+hash layer: the block is BIT-identical to running the two
+       parity-tested halves in sequence with separate workspaces, its pools match the sequence's,
+       and the r=4 layer's compressed and indexer pools actually fill. What still blocks a run:
+       the session/generate path that feeds the block the pack's weights (the resolver, and the
+       shared expert's quantized GGUF tensors through the same iq path as the packed ones), and
+       prefill attention.
     The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
     per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above.
     (The MXFP4 expert GEMV, the attention sinks, the mHC Sinkhorn mixing, the sqrtsoftplus/`tid2eid`
