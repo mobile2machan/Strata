@@ -235,10 +235,21 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
        a blob must be quantized with rows = n_out, cols = n_in, because the GEMV reads each
        output row as one contiguous run. With the reference dequantizing the same blobs, streams
        match at ~2e-2 and the pools at ~5e-3 - the q8_1 activation rounding, which measures 5e-3
-       per GEMV standalone; the three wrong wirings still come out 0.25-0.4 apart. What still blocks a run:
-       the session/generate path that feeds the block the pack's weights (the resolver, plus a
-       loader for the I32 `tid2eid` tables, which the pack skips and `NativeDense` does not
-       serve), and
+       per GEMV standalone; the three wrong wirings still come out 0.25-0.4 apart. *The resolver
+       done:* `core/dsv4_weights.cpp` fills a `Dsv4BlockWeights` for any layer from the
+       `WeightTable` + `NativeDense` (resident tensors are already device pointers; the GEMVs come
+       off the native refs with a shape + type check). It owns only the two things the pack cannot
+       serve: `indexer.proj` (the one GEMV the packer left F32 in dense.bin - converted to bf16
+       once at load) and the I32 `ffn_gate_tid2eid` tables (skipped by the pack, not a GEMV, so
+       `NativeDense` does not serve them - read from the GGUF shard that holds them). The routed
+       experts stay the caller's: 78.11 GiB does not live in VRAM, so the session's expert source
+       supplies `expert_blobs` per call, as `moe_layer` does today. `dsv4_weights_real` loads the
+       real pack, resolves all 43 layers (every pointer present, every native type one
+       `native_mmvq` implements, `native_expert_layout` sizes matching `native_experts.txt`), and
+       runs one decode token through the full block at layer 0 (hash, r=0) and layer 2 (hash +
+       indexed, r=4) with the pack's own bytes - experts copied from `experts.bin` by the
+       per-layer cumulative offsets - to a fully finite 16384-element stream out. What still
+       blocks a run: the session/generate path that drives the block per token, and
        prefill attention.
     The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
     per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above.
