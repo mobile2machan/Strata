@@ -34,6 +34,12 @@ inline bool deepseek4_geometry(const GgufFile& f, core::ModelGeometry& g, std::s
         out = (int64_t) it->second.num();
         return true;
     };
+    auto dnum = [&](const char* key, double& out) -> bool {
+        auto it = meta.find(key);
+        if (it == meta.end() || !it->second.is_num()) { err = std::string("missing ") + key; return false; }
+        out = it->second.num();
+        return true;
+    };
     auto pos = [&](const char* key, int64_t& out) -> bool {
         if (!num(key, out)) return false;
         if (out <= 0) { err = std::string(key) + " is " + std::to_string(out) + ", must be positive"; return false; }
@@ -59,6 +65,26 @@ inline bool deepseek4_geometry(const GgufFile& f, core::ModelGeometry& g, std::s
     }
     if (!pos("deepseek4.hyper_connection.count", m.hc)) return false;
     if (!pos("deepseek4.hyper_connection.sinkhorn_iterations", m.dsv4.sinkhorn_iters)) return false;
+    double eps = 0, scale = 0;
+    if (!dnum("deepseek4.hyper_connection.epsilon", eps)) return false;
+    if (eps <= 0) { err = "hyper_connection.epsilon is not positive"; return false; }
+    m.dsv4.hc_eps = (float) eps;
+    if (!pos("deepseek4.expert_gating_func", m.dsv4.gating_func)) return false;
+    if (m.dsv4.gating_func != 4) {
+        err = "expert_gating_func is " + std::to_string(m.dsv4.gating_func) +
+              ", the engine implements only sqrtsoftplus (4)";
+        return false;
+    }
+    if (!dnum("deepseek4.expert_weights_scale", scale)) return false;
+    if (scale <= 0) { err = "expert_weights_scale is not positive"; return false; }
+    m.dsv4.route_scale = (float) scale;
+    int64_t norm_i = 0;
+    if (!num("deepseek4.expert_weights_norm", norm_i)) return false;
+    if (norm_i != 1) {
+        err = "expert_weights_norm is not true, the router always renormalizes the top-k weights";
+        return false;
+    }
+    m.dsv4.weights_norm = true;
     if (!pos("deepseek4.attention.head_count", m.n_head)) return false;
     if (!pos("deepseek4.attention.head_count_kv", m.n_head_kv)) return false;
     if (!pos("deepseek4.attention.key_length", m.head_dim)) return false;
@@ -93,6 +119,21 @@ inline bool deepseek4_geometry(const GgufFile& f, core::ModelGeometry& g, std::s
     }
     for (int64_t l = 0; l < m.n_layers; ++l)
         m.dsv4.compress_ratios.push_back((int64_t) it->second.items[(size_t) l].num());
+
+    // The two SwiGLU clamp arrays are per-layer f32 (measured: 43 entries of 10.0).  Same sample guard as
+    // compress_ratios: the reader keeps only a 64-item sample of long arrays, so refuse past it.
+    auto clamps = [&](const char* key, std::vector<float>& out) -> bool {
+        auto cit = meta.find(key);
+        if (cit == meta.end() || cit->second.type != MetaType::ARRAY) { err = std::string("missing ") + key; return false; }
+        if ((int64_t) cit->second.count < m.n_layers || (int64_t) cit->second.items.size() < m.n_layers) {
+            err = std::string(key) + " does not carry " + std::to_string(m.n_layers) + " entries";
+            return false;
+        }
+        for (int64_t l = 0; l < m.n_layers; ++l) out.push_back((float) cit->second.items[(size_t) l].num());
+        return true;
+    };
+    if (!clamps("deepseek4.swiglu_clamp_exp", m.dsv4.swiglu_clamp_exp)) return false;
+    if (!clamps("deepseek4.swiglu_clamp_shexp", m.dsv4.swiglu_clamp_shexp)) return false;
 
     // vocab: the tokenizer array's COUNT (its items are P3's business).  A pack without a tokenizer still
     // has the array; a pack without it cannot serve tid2eid, and only a hash layer needs vocab - so ask

@@ -164,12 +164,24 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
       `sinkhorn.py`/`hc.py` in float64 at ~1e-7 and asserts comb-axis-swap, iters=1, half-post and
       uniform-pre observably apart - and records that at the real iters=20 the FIRST normalization pass
       (row- vs column-first) is numerically irrelevant (~1e-14, converged either way), so only the
-      iteration count matters. What still blocks a run: the pool buffers and layer wiring around
-      these kernels, and the rest of the math.
+      iteration count matters. *Router and SwiGLU done:* the metadata the router needs is now read by
+      `dsv4_geometry` (`expert_gating_func` must be 4 = sqrtsoftplus, `expert_weights_scale` 1.5,
+      `expert_weights_norm` true, per-layer `swiglu_clamp_exp`/`shexp` arrays of 10.0,
+      `hyper_connection.epsilon` 1e-6), and `dsv4_moe.hpp/.cu` computes the rest:
+      `dsv4_router_score` (sqrtsoftplus scores; the top-k weights are gathered from the PRE-bias scores,
+      the top-k is over scores+`exp_probs_b`, then renormalize and *1.5 - the bias order is the reference's),
+      `dsv4_router_hash` (layers 0-2 read their six indices from the `tid2eid` I32 table, contiguous per
+      token in GGML [used, vocab] order, and gather the same pre-bias scores), and `dsv4_swiglu`
+      (`silu(min(gate,limit)) * clamp(up,-limit,limit)` in fp32, the layer's own limit). The gate GEMV
+      itself is the existing `bf16_gemv`. `dsv4_moe_parity` matches `moe.py`/`swiglu.py` in float64 at
+      ~1e-6 with exact index agreement, and asserts dropping the bias, skipping the renormalization,
+      softmax-instead-of-sqrtsoftplus, gathering from the post-bias scores, and an unclamped swiglu all
+      observably apart. What still blocks a run: the pool buffers and layer wiring around
+      these kernels.
     The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
-    per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above;
-    sqrtsoftplus router + `tid2eid` static routing; swiglu clamp. (The MXFP4 expert GEMV, the
-    attention sinks and the mHC Sinkhorn mixing this list used to carry are done - see above.)
+    per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above.
+    (The MXFP4 expert GEMV, the attention sinks, the mHC Sinkhorn mixing, the sqrtsoftplus/`tid2eid`
+    router and the swiglu clamp this list used to carry are done - see above.)
 - **P3 - around it.** Tokenizer pre-tokenizer `joyai-llm` + special tokens (the BPE core is already
   shared); chat template and the three thinking modes in `serve/`; a `dsv4` family in `setup.py` with the
   per-machine defaults above.

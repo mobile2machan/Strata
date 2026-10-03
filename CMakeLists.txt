@@ -268,6 +268,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                            src/kernels/cuda/dsv4_indexer.cu
                            src/kernels/cuda/dsv4_quant.cu
                            src/kernels/cuda/dsv4_hc.cu
+                           src/kernels/cuda/dsv4_moe.cu
                            src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -691,6 +692,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(dsv4_hc_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(dsv4_hc_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME dsv4_hc_parity COMMAND dsv4_hc_parity --selftest)
+
+  add_executable(dsv4_moe_parity src/kernels/dsv4_moe_parity.cpp)
+  target_include_directories(dsv4_moe_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(dsv4_moe_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME dsv4_moe_parity COMMAND dsv4_moe_parity --selftest)
 
   add_executable(bf16_gemv_parity src/kernels/bf16_gemv_parity.cpp)
   target_include_directories(bf16_gemv_parity PRIVATE ${_strata_gpu_include_directories})

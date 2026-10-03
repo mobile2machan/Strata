@@ -73,6 +73,14 @@ struct ModelGeometry {
         int64_t n_expert_used = 6;
         int64_t hash_layers = 3;       ///< layers 0..hash_layers-1 route through tid2eid instead of a router
         int64_t sinkhorn_iters = 20;   ///< mHC mixing, `hyper_connection.sinkhorn_iterations`
+        float hc_eps = 1e-6f;          ///< `hyper_connection.epsilon`, the split/Sinkhorn epsilon
+        int64_t gating_func = 4;       ///< `expert_gating_func`; measured 4 = sqrtsoftplus, the only one implemented
+        float route_scale = 1.5f;      ///< `expert_weights_scale`, multiplied onto the renormalized top-k weights
+        bool weights_norm = true;      ///< `expert_weights_norm`, renormalize the top-k weights to sum 1
+        /// Per-layer SwiGLU clamps, `swiglu_clamp_exp` (routed) / `swiglu_clamp_shexp` (shared).  Measured:
+        /// 43 entries of 10.0 each; the engine applies the layer's own value.
+        std::vector<float> swiglu_clamp_exp;
+        std::vector<float> swiglu_clamp_shexp;
         /// Per layer: 0 = sliding window only; 4 = the OVERLAPPING compressor variant, and the only layers
         /// that carry an indexer; 128 = the plain compressor.  Measured on the artifact: 2 + 21 + 20 = 43,
         /// and the array itself is 46 entries long - the last three belong to no layer and are ignored.

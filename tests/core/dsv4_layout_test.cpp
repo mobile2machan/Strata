@@ -90,8 +90,16 @@ std::vector<fixture::Kv> dsv4_meta() {
         fixture::u32("deepseek4.attention.indexer.head_count", IDX_H),
         fixture::u32("deepseek4.attention.indexer.key_length", IDX_K),
         fixture::u32("deepseek4.attention.indexer.top_k", 512),
+        fixture::u32("deepseek4.expert_gating_func", 4),
+        fixture::f32("deepseek4.expert_weights_scale", 1.5f),
+        fixture::boolean("deepseek4.expert_weights_norm", true),
+        fixture::f32("deepseek4.hyper_connection.epsilon", 1e-6f),
     };
     kv.push_back(fixture::u32arr("deepseek4.attention.compress_ratios", RATIOS));
+    std::vector<float> clamps;
+    for (uint64_t l = 0; l < NL; ++l) clamps.push_back(10.0f);
+    kv.push_back(fixture::f32arr("deepseek4.swiglu_clamp_exp", clamps));
+    kv.push_back(fixture::f32arr("deepseek4.swiglu_clamp_shexp", clamps));
     std::vector<uint64_t> toks;
     for (uint64_t i = 0; i < VOCAB; ++i) toks.push_back(i);
     kv.push_back(fixture::u32arr("tokenizer.ggml.tokens", toks));
@@ -375,6 +383,22 @@ int main(int argc, char** argv) {
         std::vector<int64_t> want_ratios(RATIOS.begin(), RATIOS.end());
         check(g.dsv4.compress_ratios == want_ratios && g.dsv4.n_vocab == VOCAB, "compress_ratios / vocab");
         check(g.dsv4.hash_layers == HASH && g.dsv4.n_expert_used == USED, "hash layers / experts used");
+        check(g.dsv4.gating_func == 4 && g.dsv4.route_scale == 1.5f && g.dsv4.weights_norm,
+              "gating func / route scale / weights norm");
+        check(g.dsv4.hc_eps > 0.99e-6f && g.dsv4.hc_eps < 1.01e-6f, "hyper_connection epsilon");
+        check(g.dsv4.swiglu_clamp_exp.size() == (size_t) NL && g.dsv4.swiglu_clamp_shexp.size() == (size_t) NL &&
+                  g.dsv4.swiglu_clamp_exp[0] == 10.0f,
+              "swiglu clamp arrays");
+
+        auto bad_gate = dsv4_meta();
+        for (auto& k : bad_gate)
+            if (k.key == "deepseek4.expert_gating_func") k.u = 0;
+        auto gg5 = tmp.path / "dsv4-gate.gguf";
+        fixture::write(gg5, bad_gate, {});
+        strata::GgufFile f5(gg5.string());
+        ModelGeometry g5;
+        check(!strata::artifact::deepseek4_geometry(f5, g5, err) &&
+              err.find("expert_gating_func") != std::string::npos, "refuses a gating func the engine does not implement");
 
         auto bad = dsv4_meta();
         bad[0] = fixture::str("general.architecture", "qwen4exp");
