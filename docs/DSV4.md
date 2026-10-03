@@ -130,13 +130,21 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
      seed and decode step. `compressor_parity` checks all three real shapes (r=4 d=512, r=128 d=512,
      indexer r=4 d=128) against a float64 reference of `compress.py` (prefill rel ~7e-8, carry and decode
      exact) and asserts the three wrong readings - row-axis softmax, swapped overlap halves, -inf rows
-     zeroed instead of masked - are observably apart. What still blocks a run: the pool addressing and
-     layer wiring around these kernels, and the rest of the math.
-   The new math, in order of risk: the tiered KV pool (window 128 + compressed entries + sinks) and the
-   layer wiring that drives the compressor kernels above; the indexer scoring
-   compressed entries (the QSA stack is the base); mHC Sinkhorn mixing (the GR plumbing is the base);
-   sqrtsoftplus router + `tid2eid` static routing; swiglu clamp; attention sinks. (The MXFP4 expert GEMV
-   this list used to carry is done - see above.)
+      zeroed instead of masked - are observably apart. *Attention gather done:* `dsv4_attn.hpp/.cu` is the
+      decode-side read over the tiered pools - one block per head, gather window rows then compressed rows
+      (a row is BOTH key and value; -1 ids are skipped, not read), online softmax, and the attention SINK
+      as a null key: logit `sinks[h]`, zero value, joining the denominator once after the real rows
+      (`sparse_attn.py`'s own semantics). Pool rows are bf16 already rope-applied and quant-dequant-rounded
+      (`act_quant_fp8_inplace` is a round-trip, so the pool stores e4m3-grid values in bf16 - packing them
+      is a later memory win, not a correctness need). `dsv4_attn_parity` (full window+cmp, window-only, and
+      sink-null cases) matches a float64 reference at ~3e-7 and asserts no-sink, -1-reads-row-0 and
+      dropped-scale observably apart. What still blocks a run: the pool buffers and layer wiring around
+      these kernels, and the rest of the math.
+    The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
+    per-page carry state) and the layer wiring that drives the compressor and gather kernels above; the indexer scoring
+    compressed entries (the QSA stack is the base); mHC Sinkhorn mixing (the GR plumbing is the base);
+    sqrtsoftplus router + `tid2eid` static routing; swiglu clamp. (The MXFP4 expert GEMV and the
+    attention sinks this list used to carry are done - see above.)
 - **P3 - around it.** Tokenizer pre-tokenizer `joyai-llm` + special tokens (the BPE core is already
   shared); chat template and the three thinking modes in `serve/`; a `dsv4` family in `setup.py` with the
   per-machine defaults above.
