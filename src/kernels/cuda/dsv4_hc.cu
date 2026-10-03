@@ -1,0 +1,130 @@
+// src/kernels/cuda/dsv4_hc.cu - the DSv4 mHC split/Sinkhorn and stream mixing, docs/DSV4.md P2.
+// See the header.  The operation ORDER of the Sinkhorn loop is the reference's exactly: softmax rows,
+// +eps, ONE column normalization, then (iters-1) rounds of row-then-column.
+#include "strata/kernels/dsv4_hc.hpp"
+
+#include <cuda_runtime.h>
+
+#include <cstdio>
+#include <cstdlib>
+
+namespace strata::kernels {
+namespace {
+
+constexpr int MAX_HC = 8;  // hc is 4 in the real model; the register matrix is hc x hc
+
+void sync_if_needed(void* stream, const char* what) {
+    if (stream != nullptr) return;
+    const cudaError_t e = cudaDeviceSynchronize();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+bool check_launch(const char* what) {
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "%s launch: %s\n", what, cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+}
+
+__global__ void hc_split_sinkhorn_kernel(const float* __restrict__ mixes, const float* __restrict__ scale,
+                                         const float* __restrict__ base, int64_t hc, int64_t iters, float eps,
+                                         float* __restrict__ pre, float* __restrict__ post,
+                                         float* __restrict__ comb) {
+    const int64_t row = blockIdx.x;
+    const float* m = mixes + row * (2 + hc) * hc;
+    const int h0 = (int) hc;
+
+    for (int h = 0; h < h0; ++h)
+        pre[row * h0 + h] = 1.0f / (1.0f + expf(-(m[h] * scale[0] + base[h]))) + eps;
+    for (int h = 0; h < h0; ++h)
+        post[row * h0 + h] = 2.0f / (1.0f + expf(-(m[h0 + h] * scale[1] + base[h0 + h])));
+
+    float c[MAX_HC][MAX_HC];
+    const int off = 2 * h0;
+    for (int p = 0; p < h0; ++p) {
+        float mx = -INFINITY;
+        for (int q = 0; q < h0; ++q) mx = fmaxf(mx, m[off + p * h0 + q] * scale[2] + base[off + p * h0 + q]);
+        float s = 0.0f;
+        for (int q = 0; q < h0; ++q) {
+            c[p][q] = expf(m[off + p * h0 + q] * scale[2] + base[off + p * h0 + q] - mx);
+            s += c[p][q];
+        }
+        for (int q = 0; q < h0; ++q) c[p][q] = c[p][q] / s + eps;
+    }
+    // the initial column normalization, then (iters-1) rounds of row-then-column
+    for (int q = 0; q < h0; ++q) {
+        float s = eps;  // the reference adds eps to the sum itself
+        for (int p = 0; p < h0; ++p) s += c[p][q];
+        for (int p = 0; p < h0; ++p) c[p][q] /= s;
+    }
+    for (int64_t it = 1; it < iters; ++it) {
+        for (int p = 0; p < h0; ++p) {
+            float s = eps;
+            for (int q = 0; q < h0; ++q) s += c[p][q];
+            for (int q = 0; q < h0; ++q) c[p][q] /= s;
+        }
+        for (int q = 0; q < h0; ++q) {
+            float s = eps;
+            for (int p = 0; p < h0; ++p) s += c[p][q];
+            for (int p = 0; p < h0; ++p) c[p][q] /= s;
+        }
+    }
+    for (int p = 0; p < h0; ++p)
+        for (int q = 0; q < h0; ++q) comb[row * h0 * h0 + p * h0 + q] = c[p][q];
+}
+
+__global__ void hc_pre_combine_kernel(const float* __restrict__ x, const float* __restrict__ pre,
+                                      float* __restrict__ y, int64_t hc, int64_t d) {
+    const int64_t m = blockIdx.x;
+    const int64_t c = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    if (c >= d) return;
+    float acc = 0.0f;
+    for (int64_t h = 0; h < hc; ++h) acc += pre[m * hc + h] * x[(m * hc + h) * d + c];
+    y[m * d + c] = acc;
+}
+
+__global__ void hc_post_combine_kernel(const float* __restrict__ a, const float* __restrict__ res,
+                                       const float* __restrict__ post, const float* __restrict__ comb,
+                                       float* __restrict__ y, int64_t hc, int64_t d) {
+    const int64_t m = blockIdx.x;
+    const int64_t c = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    if (c >= d) return;
+    for (int64_t q = 0; q < hc; ++q) {
+        float acc = post[m * hc + q] * a[m * d + c];
+        for (int64_t p = 0; p < hc; ++p) acc += comb[(m * hc + p) * hc + q] * res[(m * hc + p) * d + c];
+        y[(m * hc + q) * d + c] = acc;
+    }
+}
+
+}  // namespace
+
+void hc_split_sinkhorn(const float* mixes, const float* scale, const float* base, int64_t n, int64_t hc,
+                      int64_t iters, float eps, float* pre, float* post, float* comb, void* stream) {
+    hc_split_sinkhorn_kernel<<<(unsigned) n, 1, 0, (cudaStream_t) stream>>>(mixes, scale, base, (int) hc,
+                                                                            (int) iters, eps, pre, post, comb);
+    check_launch("hc_split_sinkhorn");
+    sync_if_needed(stream, "hc_split_sinkhorn");
+}
+
+void hc_pre_combine(const float* x, const float* pre, float* y, int64_t m, int64_t hc, int64_t d,
+                    void* stream) {
+    hc_pre_combine_kernel<<<dim3((unsigned) m, (unsigned) ((d + 255) / 256)), 256, 0, (cudaStream_t) stream>>>(
+        x, pre, y, hc, d);
+    check_launch("hc_pre_combine");
+    sync_if_needed(stream, "hc_pre_combine");
+}
+
+void hc_post_combine(const float* a, const float* res, const float* post, const float* comb, float* y,
+                     int64_t m, int64_t hc, int64_t d, void* stream) {
+    hc_post_combine_kernel<<<dim3((unsigned) m, (unsigned) ((d + 255) / 256)), 256, 0, (cudaStream_t) stream>>>(
+        a, res, post, comb, y, hc, d);
+    check_launch("hc_post_combine");
+    sync_if_needed(stream, "hc_post_combine");
+}
+
+}  // namespace strata::kernels

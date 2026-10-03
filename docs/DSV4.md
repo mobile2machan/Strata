@@ -153,14 +153,23 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
       indexer's normalized Sylvester Hadamard (`WHT * d**-0.5`) that spreads the energy before the fp4
       grid. `dsv4_quant_parity` asserts the round-trips BIT-EXACT against an enumerated e4m3 grid and the
       `_round_fp4` chain (grid-times-pow2 values are exact in bf16, so any difference is real), checks the
-      tie points directly, and flags linear-scale and unnormalized-WHT. What still blocks a run: the pool
-      buffers and layer wiring around
+      tie points directly, and flags linear-scale and unnormalized-WHT. *mHC mixing done:* `dsv4_hc.hpp/.cu`
+      - the stream is `hc`=4 parallel copies of the hidden state; per sublayer `hc_split_sinkhorn` splits
+      the mix vector (`(2+hc)*hc`) into `pre` (sigmoid+eps), `post` (2*sigmoid) and a doubly-stochastic
+      `comb` (row-softmax, +eps, one column normalization, then (iters-1)=19 rounds of row-then-column,
+      each dividing by the sum+eps - the measured config is iters=20 eps=1e-6); `hc_pre_combine` collapses
+      the streams (`sum_h pre[h]*x[h]`) and `hc_post_combine` re-expands them
+      (`post[q]*a + sum_p comb[p][q]*res[p]` - the reduction is over comb's FIRST axis). The mixes
+      projection itself is the existing `bf16_gemv` plus the stream RMS factor. `dsv4_hc_parity` matches
+      `sinkhorn.py`/`hc.py` in float64 at ~1e-7 and asserts comb-axis-swap, iters=1, half-post and
+      uniform-pre observably apart - and records that at the real iters=20 the FIRST normalization pass
+      (row- vs column-first) is numerically irrelevant (~1e-14, converged either way), so only the
+      iteration count matters. What still blocks a run: the pool buffers and layer wiring around
       these kernels, and the rest of the math.
     The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
     per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above;
-    mHC Sinkhorn mixing (the GR plumbing is the base);
-    sqrtsoftplus router + `tid2eid` static routing; swiglu clamp. (The MXFP4 expert GEMV and the
-    attention sinks this list used to carry are done - see above.)
+    sqrtsoftplus router + `tid2eid` static routing; swiglu clamp. (The MXFP4 expert GEMV, the
+    attention sinks and the mHC Sinkhorn mixing this list used to carry are done - see above.)
 - **P3 - around it.** Tokenizer pre-tokenizer `joyai-llm` + special tokens (the BPE core is already
   shared); chat template and the three thinking modes in `serve/`; a `dsv4` family in `setup.py` with the
   per-machine defaults above.
