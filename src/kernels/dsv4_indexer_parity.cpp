@@ -133,6 +133,66 @@ void run_case(int64_t H, int64_t d, int64_t n_stage, int64_t valid, uint32_t see
     cudaFree(d_q); cudaFree(d_pool); cudaFree(d_w); cudaFree(d_out); cudaFree(d_ids);
 }
 
+// dsv4_indexer_select: top-k of a logits vector, -inf never picked, -1 padding.
+void run_select_case(int64_t n_stage, int64_t valid, int64_t topk, uint32_t seed, int& bad) {
+    std::printf("  select n_stage %lld valid %lld topk %lld\n", (long long) n_stage,
+                (long long) valid, (long long) topk);
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> ud(-5.0f, 5.0f);
+    std::vector<float> logits((size_t) n_stage);
+    for (auto& v : logits) v = ud(rng);
+    for (int64_t t = valid; t < n_stage; ++t) logits[(size_t) t] = -INFINITY;  // what the logits kernel emits
+
+    // reference: repeatedly take the max (lowest index on a tie), -1 once only -inf remains
+    std::vector<float> work = logits;
+    std::vector<int32_t> want((size_t) topk, -1);
+    for (int64_t j = 0; j < topk; ++j) {
+        int best = -1;
+        float bv = -INFINITY;
+        for (int64_t t = 0; t < n_stage; ++t)
+            if (work[(size_t) t] > bv) { bv = work[(size_t) t]; best = (int) t; }
+        if (best < 0 || bv == -INFINITY) break;
+        want[(size_t) j] = best;
+        work[(size_t) best] = -INFINITY;
+    }
+
+    float* d_l;
+    int32_t* d_o;
+    check(cudaMalloc(&d_l, logits.size() * 4), "alloc");
+    check(cudaMalloc(&d_o, want.size() * 4), "alloc o");
+    check(cudaMemcpy(d_l, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice), "copy");
+    strata::kernels::dsv4_indexer_select(d_l, n_stage, topk, d_o, nullptr);
+    std::vector<int32_t> got(want.size());
+    check(cudaMemcpy(got.data(), d_o, got.size() * 4, cudaMemcpyDeviceToHost), "read");
+    bool ok = true;
+    for (size_t j = 0; j < want.size(); ++j)
+        if (want[j] != got[j]) ok = false;
+    std::printf("    %-46s %s\n", "top-k picks vs reference", ok ? "ok" : "*** FAIL ***");
+    if (!ok) ++bad;
+
+    // trap: ascending order (worst-first) must differ when topk < valid
+    if (topk < valid) {
+        std::vector<int32_t> asc((size_t) topk, -1);
+        std::vector<float> w2 = logits;
+        for (int64_t j = 0; j < topk; ++j) {
+            int best = -1;
+            float bv = INFINITY;
+            for (int64_t t = 0; t < n_stage; ++t)
+                if (w2[(size_t) t] < bv && w2[(size_t) t] != -INFINITY) { bv = w2[(size_t) t]; best = (int) t; }
+            if (best < 0) break;
+            asc[(size_t) j] = best;
+            w2[(size_t) best] = INFINITY;
+        }
+        bool diff = false;
+        for (size_t j = 0; j < want.size(); ++j)
+            if (want[j] != asc[j]) diff = true;
+        std::printf("    %-46s %s\n", "ascending order observably apart", diff ? "ok" : "*** FAIL ***");
+        if (!diff) ++bad;
+    }
+    cudaFree(d_l);
+    cudaFree(d_o);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -144,6 +204,9 @@ int main(int argc, char** argv) {
     int bad = 0;
     run_case(64, 128, 200, 150, 31, bad);  // the real index shape: 64 heads, 128-wide keys
     run_case(64, 128, 64, 64, 32, bad);    // fully live
+    run_select_case(200, 150, 64, 41, bad);
+    run_select_case(64, 64, 64, 42, bad);   // topk == valid: every live block picked
+    run_select_case(64, 10, 64, 43, bad);   // topk > valid: -1 padding
     std::printf("dsv4_indexer_parity: %s\n", bad ? "*** FAIL ***" : "ok");
     return bad ? 1 : 0;
 }

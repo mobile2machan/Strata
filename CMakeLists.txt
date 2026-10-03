@@ -269,6 +269,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                            src/kernels/cuda/dsv4_quant.cu
                            src/kernels/cuda/dsv4_hc.cu
                            src/kernels/cuda/dsv4_moe.cu
+                           src/kernels/cuda/dsv4_rope.cu
                            src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -355,7 +356,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
-    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp)
+    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+    src/core/dsv4_state.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
@@ -391,6 +393,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(dsv4_layout_test PRIVATE strata_engine)
     add_test(NAME dsv4_layout_test COMMAND dsv4_layout_test)
     set_tests_properties(dsv4_layout_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+    add_executable(dsv4_state_test tests/core/dsv4_state_test.cpp)
+    target_link_libraries(dsv4_state_test PRIVATE strata_engine)
+    add_test(NAME dsv4_state_test COMMAND dsv4_state_test --selftest)
     # the same checks against the real artifact, when this machine has one (docs/DSV4.md).  A test that
     # silently skips is a test that stops running, so the absence is said at configure time.
     set(STRATA_DSV4_PACK "" CACHE PATH "a built deepseek4 pack (tools/iq_pack.py) for the real-artifact layout test")
@@ -697,6 +703,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(dsv4_moe_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(dsv4_moe_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME dsv4_moe_parity COMMAND dsv4_moe_parity --selftest)
+
+  add_executable(dsv4_rope_parity src/kernels/dsv4_rope_parity.cpp)
+  target_include_directories(dsv4_rope_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(dsv4_rope_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME dsv4_rope_parity COMMAND dsv4_rope_parity --selftest)
 
   add_executable(bf16_gemv_parity src/kernels/bf16_gemv_parity.cpp)
   target_include_directories(bf16_gemv_parity PRIVATE ${_strata_gpu_include_directories})

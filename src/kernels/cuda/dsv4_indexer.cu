@@ -76,4 +76,51 @@ void dsv4_indexer_logits(const uint16_t* q, const float* weights, const uint16_t
     sync_if_needed(stream, "dsv4_indexer_logits");
 }
 
+// top-k over the logits, descending; ties to the lower index.  CONSUMES `logits` (picked entries
+// are set to -inf), which is fine - the layer keeps them in a scratch buffer.  -inf is never
+// picked, so picks past the real ones come back -1.
+__global__ void indexer_select_kernel(float* __restrict__ logits, int64_t n_stage, int64_t topk,
+                                      int32_t* __restrict__ out) {
+    __shared__ float wv[8];
+    __shared__ int wi[8];
+    for (int64_t j = 0; j < topk; ++j) {
+        float best = -INFINITY;
+        int bidx = -1;
+        for (int64_t t = threadIdx.x; t < n_stage; t += blockDim.x) {
+            const float v = logits[t];
+            if (v > best || (v == best && v != -INFINITY && (bidx < 0 || (int) t < bidx))) {
+                best = v;
+                bidx = (int) t;
+            }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xFFFFFFFFu, best, off);
+            const int oi = __shfl_down_sync(0xFFFFFFFFu, bidx, off);
+            if (ov > best || (ov == best && ov != -INFINITY && (bidx < 0 || (oi >= 0 && oi < bidx)))) {
+                best = ov;
+                bidx = oi;
+            }
+        }
+        const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+        if (lane == 0) { wv[warp] = best; wi[warp] = bidx; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            for (int w = 1; w < (int) (blockDim.x + 31) / 32; ++w)
+                if (wv[w] > best || (wv[w] == best && wv[w] != -INFINITY && (bidx < 0 || (wi[w] >= 0 && wi[w] < bidx)))) {
+                    best = wv[w];
+                    bidx = wi[w];
+                }
+            out[j] = (best == -INFINITY) ? -1 : bidx;
+            if (bidx >= 0) logits[bidx] = -INFINITY;
+        }
+        __syncthreads();
+    }
+}
+
+void dsv4_indexer_select(float* logits, int64_t n_stage, int64_t topk, int32_t* out, void* stream) {
+    indexer_select_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(logits, n_stage, topk, out);
+    check_launch("dsv4_indexer_select");
+    sync_if_needed(stream, "dsv4_indexer_select");
+}
+
 }  // namespace strata::kernels

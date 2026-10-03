@@ -176,8 +176,21 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
       itself is the existing `bf16_gemv`. `dsv4_moe_parity` matches `moe.py`/`swiglu.py` in float64 at
       ~1e-6 with exact index agreement, and asserts dropping the bias, skipping the renormalization,
       softmax-instead-of-sqrtsoftplus, gathering from the post-bias scores, and an unclamped swiglu all
-      observably apart. What still blocks a run: the pool buffers and layer wiring around
-      these kernels.
+      observably apart. *Rope and pool state done:* `dsv4_rope.hpp/.cu` rotates the LAST 64 dims in
+      INTERLEAVED pairs (not the qwen path's neox pairing) with the reference's YaRN verbatim - the
+      frequency and the angle are kept in double because `pos * f` reaches 1e5 rad at long context,
+      where fp32 argument reduction is ~1e-2 off; `dsv4_rope_parity` matches `ops.py` in float64 at
+      ~2e-8 (bf16 rows at bf16 rounding) across both measured regimes (theta 1e4 YaRN-on, theta 1.6e5
+      YaRN-on), the r=0 no-YaRN regime, and the inverse o-path rotation, and asserts neox pairing,
+      skipping the YaRN blend, and a wrong theta observably apart. `dsv4_state.hpp/.cpp` sizes and
+      allocates the per-layer pools for one sequence bound: the 128-row window ring, the compressed
+      pool (row = block index = `p / ratio`), the indexer pool, and the compressor/indexer carry
+      registers (the paged carry ring FreeToken keeps for cross-request carry-by-value is not needed
+      for one contiguous sequence - the register IS the carry); `dsv4_state_test` checks the sizing
+      arithmetic per layer class, the arena's pointer contract, and the ring/`valid` addressing.
+      `dsv4_indexer_select` picks the top-k blocks by score (ties to the lower index, -inf never
+      picked, -1 padding) and its picks match a sort reference exactly. What still blocks a run: the
+      layer wiring that drives these kernels, and the session/generate path around it.
     The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
     per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above.
     (The MXFP4 expert GEMV, the attention sinks, the mHC Sinkhorn mixing, the sqrtsoftplus/`tid2eid`

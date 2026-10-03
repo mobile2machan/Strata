@@ -28,4 +28,11 @@ void dsv4_indexer_logits(const uint16_t* q, const float* weights, const uint16_t
                          const int32_t* ids, int64_t n_stage, int64_t valid, int64_t n_heads, int64_t d,
                          float* logits, void* stream);
 
+/// Pick the `topk` best columns of `logits` as block indices, descending by score; ties go to the
+/// lower index (torch's top-k tie order is unspecified; exact fp32 score ties are measure-zero and
+/// only permute equal-score picks).  Columns whose score is -inf (past `valid`, or ids of -1) are
+/// never picked: picks past the real ones come back -1, which is what the gather kernel skips.
+/// CONSUMES `logits` (picked entries are set to -inf) - the caller keeps them in scratch.
+void dsv4_indexer_select(float* logits, int64_t n_stage, int64_t topk, int32_t* out, void* stream);
+
 }  // namespace strata::kernels
