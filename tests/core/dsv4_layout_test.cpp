@@ -15,6 +15,7 @@
 
 #include "strata/artifact/dsv4_geometry.hpp"
 #include "strata/core/layout.hpp"
+#include "strata/core/native_dense.hpp"
 #include "strata/core/weights.hpp"
 
 #include <cuda_runtime.h>
@@ -295,6 +296,42 @@ int main(int argc, char** argv) {
         check(ld.ok, "the real pack's index.txt loads (dense only; natives skipped)");
         check(strata::core::check_all(ld.wt, g, err), "check_all passes over every real layer");
         if (!err.empty()) std::printf("    (err was: %s)\n", err.c_str());
+
+        // P2.2: the native serving path.  served_names must cover the pack's native rows except the three
+        // I32 tid2eid tables (a lookup, not a GEMV) and the two head/embedding tensors (NativeHead's);
+        // NativeDense::load must then attach every served matrix.  This is also the first engine code to
+        // read a deepseek4 GGUF: its directory validation needs the MXFP4 block geometry.
+        {
+            const std::vector<std::string> shards = strata::gguf_split_paths(argv[3]);
+            std::set<std::string> served;
+            check(strata::core::NativeDense::served_names(shards, false, served, err),
+                  "served_names reads the real shards");
+            if (!err.empty()) std::printf("    (err was: %s)\n", err.c_str());
+            bool subset = true;
+            std::set<std::string> unserved;
+            for (const auto& n : served)
+                if (!skip.count(n)) { subset = false; std::printf("    served but not a native row: %s\n", n.c_str()); }
+            for (const auto& n : skip)
+                if (!served.count(n)) unserved.insert(n);
+            check(subset, "every served name is a native row of the pack");
+            bool only_tables = !unserved.empty();
+            for (const auto& n : unserved) {
+                const bool ok = n.find("tid2eid") != std::string::npos || n == "token_embd.weight" ||
+                                n == "output.weight";
+                if (!ok) { only_tables = false; std::printf("    native row not served: %s\n", n.c_str()); }
+            }
+            check(only_tables, "the only native rows not served are tid2eid tables and the head/embedding");
+            strata::core::NativeDense dense;
+            check(dense.load(shards, ld.wt, err, false), "NativeDense loads the real dense matrices");
+            if (!err.empty()) std::printf("    (err was: %s)\n", err.c_str());
+            size_t attached = 0;
+            for (const auto& kv : ld.wt.all())
+                if (kv.second.native_data != nullptr) ++attached;
+            check(attached == served.size() && attached > 0,
+                  "every served matrix carries a native pointer");
+            std::printf("    served and attached: %zu matrices, %.2f GiB\n", attached,
+                        (double)dense.weight_bytes() / 1073741824.0);
+        }
         std::printf(g_fail ? "dsv4_layout_test: %d FAILED\n" : "dsv4_layout_test: all passed\n", g_fail);
         return g_fail ? 1 : 0;
     }

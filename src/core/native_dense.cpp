@@ -22,7 +22,14 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
         return include_ple_key && (tensor.type == 42 || tensor.type == 18 || tensor.type == 23 || tensor.type == 8);
     static const char* suffixes[] = {".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight",
         ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
-        ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
+        ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight",
+        // deepseek4 (docs/DSV4.md): the quantized projections the pack serves natively.  The F32 ones
+        // (indexer.proj, *_ape) are NOT listed - the packer put those in dense.bin, and the I32
+        // ffn_gate_tid2eid is a lookup table, not a GEMV matrix.
+        ".attn_q_a.weight", ".attn_q_b.weight", ".attn_kv.weight",
+        ".attn_output_a.weight", ".attn_output_b.weight",
+        ".attn_compressor_gate.weight", ".attn_compressor_kv.weight",
+        ".indexer_compressor_gate.weight", ".indexer_compressor_kv.weight"};
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }

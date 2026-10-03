@@ -1,9 +1,10 @@
 # DeepSeek-V4-Flash: support plan
 
 Status: **P0 done** (2026-10-03, artifact inspection), **P1 done** (the real UD-IQ2_XXS pack is built -
-78.11 GiB of experts - and verified end to end) and **P2 first step done** (the geometry reader and the
-shape checks pass against the real artifact; `dsv4_layout_real`). The engine still refuses to LOAD a
-deepseek4 pack - nothing runs this model yet. Everything marked *measured* below came from the artifact
+78.11 GiB of experts - and verified end to end) and **P2 load wiring done** (the geometry reader, the shape
+checks, and the native dense path all pass against the real artifact: `dsv4_layout_real` attaches 489 served
+matrices, 5.71 GiB). The engine can now read a deepseek4 pack's weights, but nothing computes a token yet.
+Everything marked *measured* below came from the artifact
 itself; speed figures are *estimates* with their reasoning stated, per the docs rule.
 
 Why this model: it is the first candidate whose shape matches this engine - linear-window attention with a
@@ -103,9 +104,16 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
   `tid2eid` beside a missing `exp_probs_b`. `tests/core/dsv4_layout_test.cpp` reads a synthetic GGUF and
   checks a synthetic pack covering all four fixture classes, plus the five named negatives; its `--real
   PACK SHARD1` mode (`dsv4_layout_real`, registered when `STRATA_DSV4_PACK`/`STRATA_DSV4_SHARD1` point at
-  one) reads the real metadata shard - 43 layers, 2 window / 21 r=4 / 20 r=128, 3 hash - and passes
-  `check_all` over the real pack's own index.txt. The engine still refuses to LOAD a deepseek4 pack
-  (`check_architecture` is untouched) - that wiring is the next step.
+   one) reads the real metadata shard - 43 layers, 2 window / 21 r=4 / 20 r=128, 3 hash - and passes
+   `check_all` over the real pack's own index.txt. *Load wiring done:* `check_architecture` now accepts
+   `deepseek4` (presence check only - the reader above is the real gate), `block_geometry` gained MXFP4
+   (32 elements / 17 bytes, confirmed from the artifact's own blob arithmetic: IQ2_S gate/up + MXFP4 down =
+   9,830,400 B/expert) and the raw integer types (the I32 `tid2eid`), and `NativeDense::eligible()` serves
+   the deepseek4 projections. `dsv4_layout_real` then runs the real path end to end: `served_names` covers
+   489 of the pack's 494 native rows - the five left out are exactly the three `tid2eid` tables and the
+   head/embedding (NativeHead's) - and `NativeDense::load` attaches all 489 (5.71 GiB). What is NOT served
+   natively and still blocks a run: the MXFP4 expert GEMV kernel (no Fmt<39> exists) and every piece of
+   deepseek4 math.
   The new math, in order of risk: the Compressor (gated pooling + APE + ring state,
   overlapping variant) and the tiered KV pool (window 128 + compressed entries + sinks); the indexer scoring
   compressed entries (the QSA stack is the base); mHC Sinkhorn mixing (the GR plumbing is the base);

@@ -210,9 +210,27 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 1;
         bytes = 1;
         return true;
+    case 25:   // I16 / I32 / I64: raw integers.  deepseek4's ffn_gate_tid2eid is I32 (docs/DSV4.md);
+               // the directory validation walks every tensor, so an unlisted type is a refused pack.
+        elems = 1;
+        bytes = 2;
+        return true;
+    case 26:
+        elems = 1;
+        bytes = 4;
+        return true;
+    case 27:
+        elems = 1;
+        bytes = 8;
+        return true;
     case 42:
         elems = 64;
         bytes = 18;
+        return true;
+    case 39:   // MXFP4: 32 e2m1 nibbles + one E8M0 scale.  (32, 17) confirmed against the UD-IQ2_XXS
+               // artifact's own blob arithmetic (docs/DSV4.md): IQ2_S gate/up + this down = 9,830,400 B.
+        elems = 32;
+        bytes = 17;
         return true;
     default:
         return false;
@@ -581,6 +599,14 @@ struct Qwen4ExpGuard {
 inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& want = {}) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
+    if (arch->s == "deepseek4") {
+        // The engine can now READ this family's geometry (`strata/artifact/dsv4_geometry.hpp` validates
+        // every key and the loader runs it before any weight is read), but nothing computes it yet.  This
+        // guard only confirms the family and that its keys are present; a deepseek4 pack that gets further
+        // than the loader is a bug, not a support claim.
+        if (!g.get("deepseek4.block_count")) return "missing deepseek4.block_count";
+        return {};
+    }
     if (arch->s != "qwen4exp") return "architecture is '" + arch->s + "', this engine requires 'qwen4exp'";
     struct Req {
         const char* key;
