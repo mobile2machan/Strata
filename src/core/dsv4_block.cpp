@@ -37,4 +37,29 @@ bool dsv4_block_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Blo
     return dsv4_ffn_decode_step(g, layer, w.ffn, mid, stream_out, token_id, s_ffn, cu_stream, src);
 }
 
+int64_t dsv4_block_prefill_scratch_bytes(const ModelGeometry& g, int64_t layer, int64_t n,
+                                         int64_t n_stage) {
+    return align256(dsv4_attn_prefill_scratch_bytes(g, layer, n, n_stage)) +
+           align256(dsv4_ffn_prefill_scratch_bytes(g, n)) +
+           align256(n * g.hc * g.n_embd * (int64_t) sizeof(float));
+}
+
+bool dsv4_block_prefill(const ModelGeometry& g, int64_t layer, const Dsv4BlockWeights& w,
+                        Dsv4LayerState& st, const float* stream_in, float* stream_out,
+                        const int64_t* token_ids, int64_t pos0, int64_t n, int64_t n_stage,
+                        float* scratch, void* cu_stream, Dsv4ExpertSource* src) {
+    float* p = scratch;
+    float* s_attn = p;
+    p += align256(dsv4_attn_prefill_scratch_bytes(g, layer, n, n_stage)) / (int64_t) sizeof(float);
+    float* s_ffn = p;
+    p += align256(dsv4_ffn_prefill_scratch_bytes(g, n)) / (int64_t) sizeof(float);
+    float* mid = p;  // [n][hc * n_embd]
+
+    if (!dsv4_attn_prefill_step(g, layer, w.attn, st, stream_in, mid, pos0, n, n_stage, s_attn,
+                                cu_stream))
+        return false;
+    return dsv4_ffn_prefill_step(g, layer, w.ffn, mid, stream_out, token_ids, n, s_ffn, cu_stream,
+                                 src);
+}
+
 }  // namespace strata::core

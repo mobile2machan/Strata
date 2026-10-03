@@ -1,10 +1,10 @@
 # DeepSeek-V4-Flash: support plan
 
 Status: **P0 done** (2026-10-03, artifact inspection), **P1 done** (the real UD-IQ2_XXS pack is built -
-78.11 GiB of experts - and verified end to end) and **P2 decode computing done** (the engine drives the
+78.11 GiB of experts - and verified end to end) and **P2 computing done** (the engine drives the
 whole 43-layer model over the real pack and produces its first finite, deterministic logits -
-`dsv4_generate_smoke`; ~2-3 s/token with picked-expert staging). What it cannot do yet: prefill
-and the tokenizer.
+`dsv4_generate_smoke`; ~2-3 s/token decode, an 8-token prefill chunk in 4.3 s with picked-expert
+staging). What it cannot do yet: the tokenizer.
 Everything marked *measured* below came from the artifact
 itself; speed figures are *estimates* with their reasoning stated, per the docs rule.
 
@@ -268,9 +268,17 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
         queries in one launch, each with its own window/compressed id lists - the causal window
         and the per-query indexer picks are the caller's, the kernel just gathers, one block per
         (query, head). Parity: every prefill row matches the decode kernel's reference given the
-        same lists (rel 1.3e-7), and a query given its neighbour's list is 0.66 away. What
-        still blocks a usable run: the batched prefill engine around that kernel (the block's
-        GEMVs, router and experts at n tokens instead of 1) and the tokenizer.
+        same lists (rel 1.3e-7), and a query given its neighbour's list is 0.66 away. *The
+        batched prefill engine done:* `dsv4_ffn_prefill_step` / `dsv4_attn_prefill_step` /
+        `dsv4_block_prefill` run a chunk of up to 8 tokens (the native GEMV's column limit) -
+        every quantized GEMV goes through `native_mmvq`/`quantize_q8_1_rows` with `n` columns
+        (multi-exact makes that bitwise the same as one column), the stateful parts (rope, ring
+        writes, compressor steps, indexer selection, the strided `wo_a` group slices) run per
+        position exactly as the decode step, and the gather is the batched kernel. Parity: the
+        FFN half matches the decode loop bit for bit; the attention half matches the float64
+        reference at the same ~2e-2 as the decode path; and end to end, `Dsv4Forward::prefill`
+        over the real pack gives logits **bit-identical** to eight decode steps (rel 0.000e+00)
+        in 4.3 s instead of ~16 s. What still blocks a usable run: the tokenizer.
     The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
     per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above.
     (The MXFP4 expert GEMV, the attention sinks, the mHC Sinkhorn mixing, the sqrtsoftplus/`tid2eid`

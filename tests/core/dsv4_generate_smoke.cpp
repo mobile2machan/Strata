@@ -14,6 +14,7 @@
 #include "strata/core/weights.hpp"
 
 #include <cuda_runtime.h>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -66,6 +67,7 @@ int main(int argc, char** argv) {
     const std::vector<int64_t> prompt = {0, 151, 4023, 917, 2046, 88, 12345, 60231};
     int failures = 0;
     std::vector<int64_t> sampled;
+    std::vector<float> last_logits;
     core::Dsv4Forward fwd;
     if (!fwd.init(g, pack, shards, wt, err)) { std::fprintf(stderr, "forward init: %s\n", err.c_str()); return 1; }
     for (int pass = 0; pass < 2; ++pass) {
@@ -88,9 +90,35 @@ int main(int argc, char** argv) {
                         pass, pos, (long long) prompt[pos], (long long) best, bv, bad);
             if (bad != 0) ++failures;
             got.push_back(best);
+            if (pass == 0 && pos + 1 == prompt.size()) last_logits = logits;
         }
         if (pass == 0) sampled = got;
         else if (got != sampled) { std::fprintf(stderr, "the two passes sampled differently\n"); ++failures; }
+    }
+    // ---- prefill: the same prompt in one chunk of 8 must reach the same next token, with
+    // logits inside the batched gather's summation-order noise of the decode loop's.
+    {
+        fwd.reset();
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!fwd.prefill(prompt, err)) { std::fprintf(stderr, "prefill: %s\n", err.c_str()); return 1; }
+        const auto t1 = std::chrono::steady_clock::now();
+        std::vector<float> pl((size_t) g.dsv4.n_vocab);
+        cudaMemcpy(pl.data(), fwd.logits(), (size_t) g.dsv4.n_vocab * 4, cudaMemcpyDeviceToHost);
+        size_t bad = 0;
+        for (float v : pl) if (!std::isfinite(v)) ++bad;
+        int64_t best = 0;
+        float bv = -1e30f;
+        for (int64_t v = 0; v < g.dsv4.n_vocab; ++v)
+            if (pl[(size_t) v] > bv) { bv = pl[(size_t) v]; best = v; }
+        double d = 0, m = 0;
+        for (size_t i = 0; i < pl.size(); ++i) {
+            d += std::fabs((double) pl[i] - (double) last_logits[i]);
+            m += std::fabs((double) last_logits[i]);
+        }
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        std::printf("  prefill 8 tokens in %.1f s: argmax %lld (decode said %lld), logit rel_l1 %.3e, nonfinite %zu\n",
+                    secs, (long long) best, (long long) sampled.back(), d / m, bad);
+        if (bad != 0 || best != sampled.back() || d / m > 1e-3) ++failures;
     }
     std::printf("dsv4_generate_smoke: %s\n", failures == 0 ? "ok" : "*** FAIL ***");
     return failures == 0 ? 0 : 1;

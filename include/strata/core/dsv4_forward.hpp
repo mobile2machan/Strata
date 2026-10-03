@@ -1,6 +1,6 @@
-// include/strata/core/dsv4_forward.hpp - drive one DeepSeek-V4 model, one decode token at a
-// time, docs/DSV4.md P2 integration: embed -> 43 blocks -> the head's mHC collapse ->
-// output_norm -> the native head.
+// include/strata/core/dsv4_forward.hpp - drive one DeepSeek-V4 model, one decode token or one
+// prefill chunk at a time, docs/DSV4.md P2 integration: embed -> 43 blocks -> the head's mHC
+// collapse -> output_norm -> the native head.
 //
 // The transcription of `model.py::Model.decode` for B=1.  The embedding is replicated across
 // the hc streams (`h.unsqueeze(2).repeat(1, 1, hc_mult, 1)`), each token walks every block in
@@ -40,6 +40,11 @@ public:
     /// One token at absolute position `pos`; the n_vocab logits stay in `logits()`.
     bool decode(int64_t token, int64_t pos, std::string& err);
 
+    /// The prompt tokens at positions 0..tokens.size()-1 in chunks of 8 (the native GEMV column
+    /// limit); `logits()` ends up holding the last token's.  Call `reset()` first - the chunks
+    /// assume the pools start empty.
+    bool prefill(const std::vector<int64_t>& tokens, std::string& err);
+
     /// Zero every layer's pools (a fresh sequence on the same weights).
     void reset() { state_.reset(); }
 
@@ -67,6 +72,9 @@ private:
     const float* out_norm_ = nullptr;
     float* d_a_ = nullptr;      // the two stream buffers the block hands back and forth
     float* d_b_ = nullptr;
+    float* d_pa_ = nullptr;     // the same, [8][hc * n_embd], for prefill chunks
+    float* d_pb_ = nullptr;
+    int64_t* d_ptok_ = nullptr;  // [8] token ids for the hash router
     float* d_mixes_ = nullptr;  // [6*hc] for the layers' mixing, [hc] for the head's
     float* d_pre_ = nullptr;
     float* d_y_ = nullptr;      // the collapsed [n_embd] stream

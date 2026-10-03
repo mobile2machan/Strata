@@ -55,6 +55,7 @@ bool parse_layer_experts(const std::string& path, int64_t n_layers, int64_t n_ex
 Dsv4Forward::~Dsv4Forward() {
     cudaFree(d_a_); cudaFree(d_b_); cudaFree(d_mixes_); cudaFree(d_pre_); cudaFree(d_y_);
     cudaFree(d_logits_); cudaFree(d_scratch_); cudaFree(d_blobs_);
+    cudaFree(d_pa_); cudaFree(d_pb_); cudaFree(d_ptok_);
     if (h_stage_ != nullptr) {
         cudaHostUnregister(h_stage_);
         std::free(h_stage_);
@@ -93,7 +94,8 @@ bool Dsv4Forward::init(const ModelGeometry& g, const std::string& pack_dir,
         return false;
     experts_file_ = std::fopen((pack_dir + "/experts.bin").c_str(), "rb");
     if (experts_file_ == nullptr) { err = "cannot open " + pack_dir + "/experts.bin"; return false; }
-    const int64_t stage_bytes = max_blob * g.dsv4.n_expert_used;
+    // 8 tokens per prefill chunk, k picks each - one staging buffer serves decode and prefill.
+    const int64_t stage_bytes = max_blob * g.dsv4.n_expert_used * 8;
     h_stage_ = (uint8_t*) std::malloc((size_t) stage_bytes);
     if (h_stage_ == nullptr) { err = "staging malloc"; return false; }
     if (cudaHostRegister(h_stage_, (size_t) stage_bytes, cudaHostRegisterMapped) != cudaSuccess)
@@ -109,9 +111,14 @@ bool Dsv4Forward::init(const ModelGeometry& g, const std::string& pack_dir,
     cudaMalloc((void**) &d_logits_, (size_t) g.dsv4.n_vocab * 4);
     const int64_t max_stage = max_seq / 4 + 2;
     int64_t scratch = 0;
-    for (int64_t l = 0; l < g.n_layers; ++l)
+    for (int64_t l = 0; l < g.n_layers; ++l) {
         scratch = std::max(scratch, dsv4_block_scratch_bytes(g, l, max_stage));
+        scratch = std::max(scratch, dsv4_block_prefill_scratch_bytes(g, l, 8, max_stage));
+    }
     cudaMalloc((void**) &d_scratch_, (size_t) scratch);
+    cudaMalloc((void**) &d_pa_, (size_t) 8 * hc * dim * 4);
+    cudaMalloc((void**) &d_pb_, (size_t) 8 * hc * dim * 4);
+    cudaMalloc((void**) &d_ptok_, (size_t) 8 * sizeof(int64_t));
     cudaStream_t s = nullptr;
     if (cudaStreamCreate(&s) != cudaSuccess) { err = "cudaStreamCreate"; return false; }
     stream_ = (void*) s;
@@ -161,6 +168,45 @@ bool Dsv4Forward::decode(int64_t token, int64_t pos, std::string& err) {
     if (dbg) std::printf("[dbg] y: max %.3e nonfinite %lld\n", (double) nonfinite(d_y_, dim).second, (long long) nonfinite(d_y_, dim).first);
     if (!head_.run(d_y_, d_logits_, stream_, err)) return false;
     if (dbg) std::printf("[dbg] logits nonfinite %lld\n", (long long) nonfinite(d_logits_, g_.dsv4.n_vocab).first);
+    return true;
+}
+
+bool Dsv4Forward::prefill(const std::vector<int64_t>& tokens, std::string& err) {
+    const int64_t dim = g_.n_embd, hc = g_.hc;
+    for (size_t c0 = 0; c0 < tokens.size(); c0 += 8) {
+        const int64_t n = std::min<int64_t>(8, (int64_t) tokens.size() - (int64_t) c0);
+        const int64_t pos0 = (int64_t) c0;
+        for (int64_t t = 0; t < n; ++t)
+            for (int64_t h = 0; h < hc; ++h)
+                embed_.gather_one(tokens[c0 + t], d_pa_ + (t * hc + h) * dim, stream_);
+        cudaMemcpyAsync(d_ptok_, tokens.data() + c0, (size_t) n * sizeof(int64_t),
+                        cudaMemcpyHostToDevice, (cudaStream_t) stream_);
+        float* in = d_pa_;
+        float* out = d_pb_;
+        const int64_t n_stage = (pos0 + n - 1) / 4 + 2;
+        for (int64_t l = 0; l < g_.n_layers; ++l) {
+            stager_.off = layer_off_[(size_t) l];
+            Dsv4BlockWeights w;
+            if (!resolver_.resolve(g_, *wt_, l, layer_layout_[(size_t) l], nullptr, w, err))
+                return false;
+            if (!dsv4_block_prefill(g_, l, w, state_.layer(l), in, out, d_ptok_, pos0, n, n_stage,
+                                    d_scratch_, stream_, &stager_)) {
+                err = "prefill failed at layer " + std::to_string(l);
+                return false;
+            }
+            std::swap(in, out);
+        }
+        // the head's collapse on the last token of the whole prompt - that is the one sampled.
+        if (c0 + (size_t) n == tokens.size()) {
+            const float* last = in + (n - 1) * hc * dim;
+            kernels::hc_mixes(last, hc_head_fn_, d_mixes_, 1, hc * dim, hc, g_.dsv4.hc_eps, stream_);
+            kernels::hc_head_pre(d_mixes_, hc_head_scale_, hc_head_base_, d_pre_, 1, hc,
+                                 g_.dsv4.hc_eps, stream_);
+            kernels::hc_pre_combine(last, d_pre_, d_y_, 1, hc, dim, stream_);
+            kernels::rms_norm_weighted(d_y_, out_norm_, 1, dim, g_.dsv4.norm_eps, stream_);
+            if (!head_.run(d_y_, d_logits_, stream_, err)) return false;
+        }
+    }
     return true;
 }
 

@@ -64,6 +64,18 @@ struct Dsv4AttnWeights {
 /// Workspace bytes for one decode step of `layer` with a staging width of `n_stage` cmp columns.
 int64_t dsv4_attn_scratch_bytes(const ModelGeometry& g, int64_t layer, int64_t n_stage);
 
+/// Workspace bytes for one prefill chunk of `n` tokens (1..8) covering positions `pos0..pos0+n-1`,
+/// `n_stage` the per-query column bound at the chunk's last position.
+int64_t dsv4_attn_prefill_scratch_bytes(const ModelGeometry& g, int64_t layer, int64_t n,
+                                        int64_t n_stage);
+
+/// `n` tokens through the attention half at positions `pos0..pos0+n-1`.  Streams are
+/// token-major [n][hc * n_embd] f32; `n_stage` bounds each query's scored columns.
+bool dsv4_attn_prefill_step(const ModelGeometry& g, int64_t layer, const Dsv4AttnWeights& w,
+                            Dsv4LayerState& st, const float* stream_in, float* stream_out,
+                            int64_t pos0, int64_t n, int64_t n_stage, float* scratch,
+                            void* cu_stream);
+
 /// One decode token through the attention half.  `stream_in`/`stream_out` are [hc * n_embd] f32
 /// (they may alias nothing else); `n_stage` bounds the compressed staging (the caller passes the
 /// live count `(pos + 1) / ratio`).

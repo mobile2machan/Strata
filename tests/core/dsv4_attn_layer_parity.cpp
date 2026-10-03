@@ -430,7 +430,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "state init: %s\n", err.c_str());
         return 1;
     }
-    const core::Dsv4LayerState st = state.layer(0);
+    core::Dsv4LayerState st = state.layer(0);  // prefill writes the pools through it
     const int64_t max_stage = (ntok + 3) / 4;
     const int64_t scratch_bytes = core::dsv4_attn_scratch_bytes(g, 0, max_stage);
     float* scratch = (float*) dalloc((size_t) scratch_bytes);
@@ -684,6 +684,41 @@ int main(int argc, char** argv) {
         const double r = rel_l1(t_out, engine_out[(size_t) (ntok - 1)]);
         std::printf("    %-30s apart by %.3e\n", kv.first, r);
         expect(r > 1e-1, kv.first);
+    }
+
+    // ---- prefill: the same eight tokens in one chunk must reproduce the decode loop.  The
+    // GEMVs run multi-column (bitwise the same as single-column), the stateful parts run per
+    // position, and the gather is the batched kernel - so any divergence is wiring, not math.
+    {
+        state.reset();
+        const int64_t n = ntok;
+        const int64_t nst = core::dsv4_cmp_valid(ntok - 1, 4);
+        const int64_t pbytes = core::dsv4_attn_prefill_scratch_bytes(g, 0, n, nst);
+        float* pscratch = (float*) dalloc((size_t) pbytes);
+        std::vector<float> in_f((size_t) n * hc * dim);
+        for (int64_t t = 0; t < n; ++t)
+            for (size_t i = 0; i < (size_t) hc * dim; ++i)
+                in_f[(size_t) t * hc * dim + i] = (float) streams[(size_t) t][i];
+        float* d_in = (float*) dalloc(in_f.size() * 4);
+        float* d_out = (float*) dalloc(in_f.size() * 4);
+        cudaMemcpy(d_in, in_f.data(), in_f.size() * 4, cudaMemcpyHostToDevice);
+        if (!core::dsv4_attn_prefill_step(g, 0, w, st, d_in, d_out, 0, n, nst, pscratch, g_stream)) {
+            std::fprintf(stderr, "prefill step failed\n");
+            return 1;
+        }
+        std::vector<float> out_f(in_f.size());
+        cudaMemcpy(out_f.data(), d_out, out_f.size() * 4, cudaMemcpyDeviceToHost);
+        std::printf("  prefill chunk of %lld tokens\n", (long long) n);
+        for (int64_t t = 0; t < n; ++t) {
+            std::vector<double> got(out_f.begin() + (ptrdiff_t)(t * hc * dim),
+                                   out_f.begin() + (ptrdiff_t)((t + 1) * hc * dim));
+            const double r = rel_l1(ref_out[(size_t) t], got);
+            std::printf("    prefill token %lld rel_l1 %.3e\n", (long long) t, r);
+            expect(r < 3e-2, "prefill matches the decode loop");
+        }
+        cudaFree(d_in);
+        cudaFree(d_out);
+        cudaFree(pscratch);
     }
 
     std::printf("dsv4_attn_parity: %s\n", failures == 0 ? "ok" : "*** FAIL ***");

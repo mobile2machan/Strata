@@ -34,4 +34,16 @@ bool dsv4_block_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Blo
                             int64_t pos, int64_t token_id, int64_t n_stage, float* scratch,
                             void* cu_stream, Dsv4ExpertSource* src = nullptr);
 
+/// Workspace bytes for one prefill chunk of `n` tokens (1..8) at `layer` with `n_stage` cmp columns.
+int64_t dsv4_block_prefill_scratch_bytes(const ModelGeometry& g, int64_t layer, int64_t n,
+                                         int64_t n_stage);
+
+/// `n` tokens (1..8) at positions `pos0..pos0+n-1` through the whole block in one pass.  Streams
+/// are token-major [n][hc * n_embd] f32 and must not alias each other; `token_ids` selects the
+/// hash row per token.  Same math as `n` decode steps at consecutive positions.
+bool dsv4_block_prefill(const ModelGeometry& g, int64_t layer, const Dsv4BlockWeights& w,
+                        Dsv4LayerState& st, const float* stream_in, float* stream_out,
+                        const int64_t* token_ids, int64_t pos0, int64_t n, int64_t n_stage,
+                        float* scratch, void* cu_stream, Dsv4ExpertSource* src = nullptr);
+
 }  // namespace strata::core

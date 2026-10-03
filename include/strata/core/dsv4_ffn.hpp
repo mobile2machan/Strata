@@ -59,4 +59,16 @@ bool dsv4_ffn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnWe
                           const float* stream_in, float* stream_out, int64_t token_id, float* scratch,
                           void* cu_stream, Dsv4ExpertSource* src = nullptr);
 
+/// Workspace bytes for one prefill chunk of `n` tokens (1..8, the native GEMV column limit).
+int64_t dsv4_ffn_prefill_scratch_bytes(const ModelGeometry& g, int64_t n);
+
+/// `n` tokens through the FFN half in one pass: the GEMVs run with `n` columns, the router and
+/// the hc mixing per row, the routed experts once per (token, pick).  Streams are token-major
+/// [n][hc * n_embd] f32; `token_ids` selects the hash row per token (ignored off hash layers).
+/// Same math as `n` decode steps - the parity test is the decode loop.
+bool dsv4_ffn_prefill_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnWeights& w,
+                           const float* stream_in, float* stream_out, const int64_t* token_ids,
+                           int64_t n, float* scratch, void* cu_stream,
+                           Dsv4ExpertSource* src = nullptr);
+
 }  // namespace strata::core

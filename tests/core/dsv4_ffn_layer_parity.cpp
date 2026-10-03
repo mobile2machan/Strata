@@ -489,6 +489,45 @@ int main(int argc, char** argv) {
         expect(rel_l1(o3, eng) > 1e-2, "clamp dropped is apart");
     }
 
+    // ---- prefill parity: n tokens through the FFN half in one pass must equal each token
+    // through the decode half (the FFN half is stateless), and a hash layer must key on each
+    // token's own id.
+    {
+        const int64_t n = 4, layer = 0;  // layer 0 is the hash layer: ids matter
+        const int64_t toks[n] = {5, 6, 7, 11};
+        std::vector<float> in_f((size_t) n * hc * dim);
+        for (auto& v : in_f) v = (float) nrm();
+        float* d_in = (float*) dalloc(in_f.size() * 4);
+        float* d_pf = (float*) dalloc(in_f.size() * 4);
+        float* d_dec = (float*) dalloc((size_t) hc * dim * 4);
+        float* d_scr = (float*) dalloc((size_t) core::dsv4_ffn_prefill_scratch_bytes(g, n));
+        cudaMemcpy(d_in, in_f.data(), in_f.size() * 4, cudaMemcpyHostToDevice);
+        expect(core::dsv4_ffn_prefill_step(g, layer, w[(size_t) layer], d_in, d_pf, toks, n, d_scr,
+                                           g_stream), "prefill step ran");
+        std::vector<float> pf(in_f.size());
+        cudaMemcpy(pf.data(), d_pf, pf.size() * 4, cudaMemcpyDeviceToHost);
+        std::vector<float> dec(in_f.size());
+        for (int64_t t = 0; t < n; ++t) {
+            core::dsv4_ffn_decode_step(g, layer, w[(size_t) layer],
+                                       d_in + (size_t) t * hc * dim, d_dec, toks[t], scratch,
+                                       g_stream);
+            cudaMemcpy(dec.data() + (size_t) t * hc * dim, d_dec, (size_t) hc * dim * 4,
+                       cudaMemcpyDeviceToHost);
+        }
+        std::vector<double> a(pf.begin(), pf.end()), b(dec.begin(), dec.end());
+        const double r = rel_l1(b, a);
+        std::printf("  prefill n %lld vs decode loop rel_l1 %.3e\n", (long long) n, r);
+        expect(r < 1e-5, "prefill matches the decode loop");
+
+        const int64_t swapped[n] = {6, 5, 7, 11};  // a hash layer must key on each token's own id
+        expect(core::dsv4_ffn_prefill_step(g, layer, w[(size_t) layer], d_in, d_pf, swapped, n, d_scr,
+                                           g_stream), "swapped prefill ran");
+        cudaMemcpy(pf.data(), d_pf, pf.size() * 4, cudaMemcpyDeviceToHost);
+        std::vector<double> sw(pf.begin(), pf.end());
+        expect(rel_l1(b, sw) > 1e-2, "swapped token ids are apart");
+        cudaFree(d_in); cudaFree(d_pf); cudaFree(d_dec); cudaFree(d_scr);
+    }
+
     std::printf("dsv4_ffn_layer_parity: %s\n", failures == 0 ? "ok" : "*** FAIL ***");
     return failures == 0 ? 0 : 1;
 }
