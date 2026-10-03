@@ -1,11 +1,10 @@
 # DeepSeek-V4-Flash: support plan
 
 Status: **P0 done** (2026-10-03, artifact inspection), **P1 done** (the real UD-IQ2_XXS pack is built -
-78.11 GiB of experts - and verified end to end) and **P2 loading done** (the geometry reader, the shape
-checks, the native dense path and the expert kernels all pass against the real artifact: `dsv4_layout_real`
-attaches 489 served matrices, 5.71 GiB, and accepts all 43 layers' expert pairs). The engine can now read
-every weight of a deepseek4 pack; what it cannot do yet is compute a token - none of the deepseek4 math
-exists.
+78.11 GiB of experts - and verified end to end) and **P2 decode computing done** (the engine drives the
+whole 43-layer model over the real pack and produces its first finite, deterministic logits -
+`dsv4_generate_smoke`; ~1 min/token, disk-bound expert streaming). What it cannot do yet: prefill,
+the tokenizer, and usable speed.
 Everything marked *measured* below came from the artifact
 itself; speed figures are *estimates* with their reasoning stated, per the docs rule.
 
@@ -246,11 +245,23 @@ and are expected to sit at 3-8 tok/s. These are the claim to beat, not a claim.
        supplies `expert_blobs` per call, as `moe_layer` does today. `dsv4_weights_real` loads the
        real pack, resolves all 43 layers (every pointer present, every native type one
        `native_mmvq` implements, `native_expert_layout` sizes matching `native_experts.txt`), and
-       runs one decode token through the full block at layer 0 (hash, r=0) and layer 2 (hash +
-       indexed, r=4) with the pack's own bytes - experts copied from `experts.bin` by the
-       per-layer cumulative offsets - to a fully finite 16384-element stream out. What still
-       blocks a run: the session/generate path that drives the block per token, and
-       prefill attention.
+        runs one decode token through the full block at layer 0 (hash, r=0) and layer 2 (hash +
+        indexed, r=4) with the pack's own bytes - experts copied from `experts.bin` by the
+        per-layer cumulative offsets - to a fully finite 16384-element stream out. *The first
+        tokens done:* `core/dsv4_forward.cpp` drives the whole model per token - `NativeEmbed`
+        replicated across the four hc streams, all 43 blocks in order (each layer's 256-expert
+        region streamed from `experts.bin` through a pinned staging buffer just before that layer
+        runs), the head's mHC collapse (`hc_mixes` + the new `hc_head_pre` sigmoid +
+        `hc_pre_combine`), `output_norm`, and `NativeHead` on `output.weight`.
+        `dsv4_generate_smoke` decodes four positions of a fixed prompt over the real pack: every
+        logit row is finite, the argmaxes are in range, and a second run from a zeroed state
+        samples identically. Two things that took a debug pass to find: `iq_mmvq`'s dispatch
+        lacked MXFP4 (type 39) even though the format was implemented - layers 26 and 42 have
+        FP4 down matrices - and a 32-bit `fseek` into `experts.bin` silently wrapped past 4 GiB,
+        which read the wrong layer's experts from layer 3 on. What still blocks a usable run:
+        prefill attention, the tokenizer, and speed (a decode step streams 1.9 GB per layer from
+        disk, ~1 min/token; the picked-expert-only staging and the session's expert cache are
+        the fix).
     The new math, in order of risk: the tiered KV pool buffers (window 128 ring + compressed rows +
     per-page carry state) and the layer wiring that drives the compressor, indexer-score and gather kernels above.
     (The MXFP4 expert GEMV, the attention sinks, the mHC Sinkhorn mixing, the sqrtsoftplus/`tid2eid`

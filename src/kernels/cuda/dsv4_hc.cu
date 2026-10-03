@@ -164,4 +164,24 @@ void hc_post_combine(const float* a, const float* res, const float* post, const 
     sync_if_needed(stream, "hc_post_combine");
 }
 
+// The head's collapse (model.py::Model.hc_head): pre = sigmoid(mixes * scale + base) + eps -
+// the layer hc_pre's mixing without the Sinkhorn, one scalar scale.
+__global__ void hc_head_pre_kernel(const float* __restrict__ mixes, const float* __restrict__ scale,
+                                   const float* __restrict__ base, int64_t hc, float eps,
+                                   float* __restrict__ pre) {
+    const int64_t m = blockIdx.x;
+    const int h = threadIdx.x;
+    if (h >= hc) return;
+    const float s = 1.0f / (1.0f + __expf(-(mixes[m * hc + h] * scale[0] + base[h])));
+    pre[m * hc + h] = s + eps;
+}
+
+void hc_head_pre(const float* mixes, const float* scale, const float* base, float* pre, int64_t n,
+                 int64_t hc, float eps, void* stream) {
+    hc_head_pre_kernel<<<(unsigned) n, (unsigned) hc, 0, (cudaStream_t) stream>>>(mixes, scale, base,
+                                                                                  hc, eps, pre);
+    check_launch("hc_head_pre");
+    sync_if_needed(stream, "hc_head_pre");
+}
+
 }  // namespace strata::kernels

@@ -49,6 +49,7 @@ bool Dsv4State::init(const ModelGeometry& g, int64_t max_seq, std::string& err) 
         return false;
     }
     cudaMemset(arena_, 0, (size_t) total);
+    arena_bytes_ = (size_t) total;
     layers_.assign((size_t) g.n_layers, Dsv4LayerState{});
     char* at = (char*) arena_;
     for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -81,6 +82,10 @@ void Dsv4State::free() {
     if (arena_ != nullptr) cudaFree(arena_);
     arena_ = nullptr;
     layers_.clear();
+}
+
+void Dsv4State::reset() {
+    if (arena_ != nullptr) cudaMemset(arena_, 0, arena_bytes_);
 }
 
 }  // namespace strata::core

@@ -11,6 +11,9 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <vector>
 
 namespace strata::core {
@@ -91,6 +94,16 @@ void dsv4_ffn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnWe
     Cursor cur{(char*) scratch, 0, false};
     Scratch s = carve(cur, g);
 
+    const bool dbg = std::getenv("DSV4_DBG") != nullptr && layer == 3;
+    auto peek = [&](const char* what, const float* d, int64_t n) {
+        if (!dbg) return;
+        std::vector<float> h((size_t) n);
+        cudaMemcpy(h.data(), d, (size_t) n * 4, cudaMemcpyDeviceToHost);
+        float mx = 0; int64_t bad = 0;
+        for (float v : h) { if (!std::isfinite(v)) ++bad; else mx = std::max(mx, std::fabs(v)); }
+        std::printf("[ffn3] %-10s max %.3e nonfinite %lld\n", what, mx, (long long) bad);
+    };
+
     // ---- hc_pre(ffn): mixes GEMV + RMS factor, split/Sinkhorn, collapse the streams.
     kernels::hc_mixes(stream_in, w.hc_fn, s.mixes, 1, hc * dim, mix_hc, g.dsv4.hc_eps, cu);
     kernels::hc_split_sinkhorn(s.mixes, w.hc_scale, w.hc_base, 1, hc, g.dsv4.sinkhorn_iters,
@@ -117,6 +130,13 @@ void dsv4_ffn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnWe
     h_rw.resize((size_t) k);
     cudaMemcpy(h_ids.data(), s.ids, (size_t) k * 4, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_rw.data(), s.rw, (size_t) k * 4, cudaMemcpyDeviceToHost);
+    if (dbg) {
+        peek("y", s.y, dim);
+        peek("logits", s.logits, g.n_expert);
+        std::printf("[ffn3] picks:");
+        for (int64_t e = 0; e < k; ++e) std::printf(" %d*%.3f", h_ids[(size_t) e], h_rw[(size_t) e]);
+        std::printf("\n");
+    }
 
     // ---- the shared expert: native GGUF GEMVs on the q8_1 activation (the same block format the
     // routed path uses, quantized once), and the clamped SwiGLU, weight 1.
@@ -126,6 +146,7 @@ void dsv4_ffn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnWe
     kernels::dsv4_swiglu(s.gu, s.gu + ff, s.ff, ff, g.dsv4.swiglu_clamp_shexp[(size_t) layer], cu);
     kernels::quantize_q8_1_rows(s.ff, 1, ff, s.fq, cu);
     kernels::native_mmvq(w.sh_down_type, w.sh_down, s.fq, s.y2, (int) ff, (int) dim, 1, cu);
+    peek("y2_shared", s.y2, dim);
 
     // ---- the routed experts: the pack's native blobs through iq_mmvq, q8_1 activations both
     // sides, the same clamped SwiGLU, then the router's weights onto each down output.
@@ -135,16 +156,19 @@ void dsv4_ffn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnWe
         kernels::iq_mmvq(w.experts.gu_type, blob, s.xq, s.gu, (int) dim, (int) ff, 1, cu);
         kernels::iq_mmvq(w.experts.gu_type, blob + w.experts.up_off, s.xq, s.gu + ff, (int) dim,
                          (int) ff, 1, cu);
+        if (dbg && e == 0) { peek("gu", s.gu, 2 * ff); std::printf("[ffn3] blob_off %lld id %d bytes %lld\n", (long long) (blob - w.expert_blobs), h_ids[(size_t) e], (long long) w.experts.bytes); }
         kernels::dsv4_swiglu(s.gu, s.gu + ff, s.ff, ff, gu_limit, cu);
         kernels::quantize_q8_1_rows(s.ff, 1, ff, s.fq, cu);
         kernels::iq_mmvq(w.experts.d_type, blob + w.experts.down_off, s.fq, s.part, (int) ff,
                          (int) dim, 1, cu);
         kernels::scale_inplace(s.part, dim, h_rw[(size_t) e], cu);
         kernels::add_inplace(s.y2, s.part, dim, cu);
+        if (dbg) { peek("part", s.part, dim); peek("y2", s.y2, dim); }
     }
 
     // ---- hc_post(ffn).
     kernels::hc_post_combine(s.y2, stream_in, s.post, s.comb, stream_out, 1, hc, dim, cu);
+    peek("out", stream_out, hc * dim);
 }
 
 }  // namespace strata::core

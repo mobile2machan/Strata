@@ -358,7 +358,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
       src/core/dsv4_state.cpp src/core/dsv4_attn.cpp src/core/dsv4_ffn.cpp src/core/dsv4_block.cpp
-      src/core/dsv4_weights.cpp)
+      src/core/dsv4_weights.cpp src/core/dsv4_forward.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
@@ -428,6 +428,11 @@ set_tests_properties(dsv4_block_layer_parity PROPERTIES TIMEOUT 600)
       add_test(NAME dsv4_weights_real
                COMMAND dsv4_weights_real --real ${STRATA_DSV4_PACK} ${STRATA_DSV4_SHARD1})
       set_tests_properties(dsv4_weights_real PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+      add_executable(dsv4_generate_smoke tests/core/dsv4_generate_smoke.cpp)
+      target_link_libraries(dsv4_generate_smoke PRIVATE strata_engine strata_artifact strata_kernels_cpu)
+      add_test(NAME dsv4_generate_smoke
+               COMMAND dsv4_generate_smoke --real ${STRATA_DSV4_PACK} ${STRATA_DSV4_SHARD1})
+      set_tests_properties(dsv4_generate_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
     else()
       message(STATUS "strata: STRATA_DSV4_PACK / STRATA_DSV4_SHARD1 not set - the real deepseek4 layout test is NOT registered")
     endif()

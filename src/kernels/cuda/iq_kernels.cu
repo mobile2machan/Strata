@@ -537,7 +537,7 @@ template<> struct Fmt<39> { static constexpr int qk = 32, ipb = 4, step = 1;   /
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8)
 #define STRATA_D_FMTS(X) X(18) X(20) X(23) X(42) X(7) X(6) X(8) X(39)
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8)
+#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8) X(39)
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll

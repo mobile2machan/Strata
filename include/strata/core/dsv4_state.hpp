@@ -57,12 +57,15 @@ class Dsv4State {
 public:
     bool init(const ModelGeometry& g, int64_t max_seq, std::string& err);
     void free();
+    /// Zero every pool back to its fresh `init` contents (same positions, same run twice).
+    void reset();
     Dsv4LayerState& layer(int64_t l) { return layers_[(size_t) l]; }
     const Dsv4LayerState& layer(int64_t l) const { return layers_[(size_t) l]; }
 
 private:
     std::vector<Dsv4LayerState> layers_;
     void* arena_ = nullptr;
+    size_t arena_bytes_ = 0;
 };
 
 // ---- addressing (pure arithmetic; the layer and its tests share these) ----

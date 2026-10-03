@@ -15,7 +15,9 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -141,6 +143,16 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
         kernels::native_mmvq(type, wgt, xq, y, (int) n_in, (int) n_out, 1, cu);
     };
 
+    const bool dbg = std::getenv("DSV4_DBG") != nullptr && layer == 3;
+    auto peek = [&](const char* what, const float* d, int64_t n) {
+        if (!dbg) return;
+        std::vector<float> h((size_t) n);
+        cudaMemcpy(h.data(), d, (size_t) n * 4, cudaMemcpyDeviceToHost);
+        float mx = 0; int64_t bad = 0;
+        for (float v : h) { if (!std::isfinite(v)) ++bad; else mx = std::max(mx, std::fabs(v)); }
+        std::printf("[attn3] %-10s max %.3e nonfinite %lld\n", what, mx, (long long) bad);
+    };
+
     // ---- hc_pre(attn): mixes GEMV + RMS factor, split/Sinkhorn, collapse the streams.
     kernels::hc_mixes(stream_in, w.hc_fn, s.mixes, 1, hc * dim, mix_hc, g.dsv4.hc_eps, cu);
     kernels::hc_split_sinkhorn(s.mixes, w.hc_scale, w.hc_base, 1, hc, g.dsv4.sinkhorn_iters,
@@ -149,6 +161,7 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
 
     // ---- attn_norm, then the LoRA-split Q.
     kernels::rms_norm_weighted(s.y, w.norm, 1, dim, eps, cu);
+    peek("y", s.y, dim);
     gemm(s.y, w.q_a_type, w.q_a, s.qr, dim, g.dsv4.q_lora, s.xq_dim);
     kernels::rms_norm_weighted(s.qr, w.q_a_norm, 1, g.dsv4.q_lora, eps, cu);
     gemm(s.qr, w.q_b_type, w.q_b, s.q, g.dsv4.q_lora, g.n_head * hd, s.xq_qr);
@@ -158,6 +171,7 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
     const int64_t attn_orig = compressed ? g.dsv4.yarn_orig : 0;
     kernels::dsv4_rope_f32(s.q, g.n_head, hd, rd, pos, g.dsv4.rope_theta, g.dsv4.yarn_factor,
                            attn_orig, g.dsv4.yarn_beta_fast, g.dsv4.yarn_beta_slow, false, cu);
+    peek("q", s.q, g.n_head * hd);
 
     // ---- kv: one head, norm, rope, e4m3 round-trip on the non-rope part, ring write.
     gemm(s.y, w.kv_type, w.kv, s.kv, dim, hd, s.xq_dim);
@@ -174,6 +188,8 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
         const int64_t item = (indexed ? 2 : 1) * hd;
         gemm(s.y, w.comp_kv_type, w.comp_kv, s.ckv, dim, item, s.xq_dim);
         gemm(s.y, w.comp_gate_type, w.comp_gate, s.csc, dim, item, s.xq_dim);
+        peek("ckv", s.ckv, item);
+        peek("csc", s.csc, item);
         kernels::compressor_decode_step(pos, ratio, indexed, hd, s.ckv, s.csc, w.ape, st.ks, st.ss,
                                         s.cmp_f, cu);
         if ((pos + 1) % ratio == 0) {
@@ -202,6 +218,8 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
         kernels::hadamard(s.iq, s.iq_h, g.idx_q_heads, g.idx_key_dim, cu);
         kernels::roundtrip_fp4_e2m1(s.iq_h, s.iq_bf, g.idx_q_heads * g.idx_key_dim, 32, cu);
         kernels::bf16_gemv_fp32_mmvf(s.y, w.idx_proj, s.iq_w, dim, g.idx_q_heads, cu);
+        peek("iq", s.iq, g.idx_q_heads * g.idx_key_dim);
+        peek("iq_w", s.iq_w, g.idx_q_heads);
         const float idx_scale = (float)(1.0 / std::sqrt((double) g.idx_key_dim) /
                                         std::sqrt((double) g.idx_q_heads));
         kernels::scale_inplace(s.iq_w, g.idx_q_heads, idx_scale, cu);
@@ -264,6 +282,7 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
                              g.n_head, hd, s.o, cu);
     kernels::dsv4_rope_f32(s.o, g.n_head, hd, rd, pos, g.dsv4.rope_theta, g.dsv4.yarn_factor,
                            attn_orig, g.dsv4.yarn_beta_fast, g.dsv4.yarn_beta_slow, true, cu);
+    peek("o", s.o, g.n_head * hd);
 
     // ---- wo: the grouped einsum is one GEMV per group over the flattened wo_a, then wo_b.
     // The group offset is in BYTES: a quantized row is not `dim` bytes wide.
@@ -273,9 +292,11 @@ void dsv4_attn_decode_step(const ModelGeometry& g, int64_t layer, const Dsv4Attn
         gemm(s.o + gr * hpg * hd, w.out_a_type, w.out_a + gr * g.dsv4.o_lora * oa_row_bytes,
              s.wo_tmp + gr * g.dsv4.o_lora, hpg * hd, g.dsv4.o_lora, s.xq_dim);
     gemm(s.wo_tmp, w.out_b_type, w.out_b, s.y, g.dsv4.o_groups * g.dsv4.o_lora, dim, s.xq_ob);
+    peek("wo", s.y, dim);
 
     // ---- hc_post(attn).
     kernels::hc_post_combine(s.y, stream_in, s.post, s.comb, stream_out, 1, hc, dim, cu);
+    peek("out", stream_out, hc * dim);
 }
 
 }  // namespace strata::core

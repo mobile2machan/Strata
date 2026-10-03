@@ -47,4 +47,9 @@ void hc_pre_combine(const float* x, const float* pre, float* y, int64_t m, int64
 void hc_post_combine(const float* a, const float* res, const float* post, const float* comb, float* y,
                      int64_t m, int64_t hc, int64_t d, void* stream);
 
+/// The head's collapse (model.py::Model.hc_head): `pre = sigmoid(mixes * scale[0] + base[h]) + eps`,
+/// the layer mixing without the Sinkhorn.  `mixes`/`pre` are [n][hc].
+void hc_head_pre(const float* mixes, const float* scale, const float* base, float* pre, int64_t n,
+                 int64_t hc, float eps, void* stream);
+
 }  // namespace strata::kernels
