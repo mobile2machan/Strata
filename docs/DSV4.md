@@ -537,6 +537,43 @@ from disk, and nothing about a drafter or a verify window removes those bytes.
 - **P5 - GLM-5.3-Flash.** Same mHC, same indexer family, same streaming; adds KDA (close to the GDN kernels)
   and MLA/kpool. Roughly a third the cost once P1-P3 exist.
 
+## Why this does not pay off on a 24 GB card (measured 2026-10-05)
+
+  The same PC (RTX PRO 4000 Blackwell + RTX 3090, 128 GB RAM), the same day, both measured through the API with a
+  96-token completion at temperature 0:
+
+  | | ms/token | tok/s |
+  |---|---:|---:|
+  | Qwen3.8-Flash-Next IQ3_S, both cards, the config this box runs (`strata-iq3_s-dual-gpu.json`) | 14.9 | 67.2 (55 drafts, 47 accepted: ~2.0 tokens per verify pass) |
+  | DeepSeek-V4-Flash UD-IQ2_XXS, the best arm of the table above (Blackwell, `--dsv4-experts-ram auto`, drafter, depth 3) | 217.8 | 4.59 |
+
+  14.6x, and the ceiling is the model's bytes rather than the code: one token needs 1,874.6 MiB (1.83 GiB) of
+  expert weights, and the pinned host-to-device path on this box tops out at 21.6 GiB/s, so a perfect
+  implementation - every blob page-locked, the copy overlapped with the compute - still cannot go below 1.83 /
+  21.6 s = 84.8 ms/token, 11.8 tok/s. The driver page-locks 50.11 of the 78.11 GiB, so the number actually
+  reached is 4.59.
+
+  Nothing that makes Strata fast on Qwen3.8-Flash-Next carries over to this architecture:
+
+  | Qwen3.8-Flash-Next | DeepSeek-V4-Flash |
+  |---|---|
+  | all 24,576 experts in a 34-43 GB pinned arena, a large part of them resident in the GPU's expert cache | 78.11 GiB of experts, and 0 bytes of them fit: the 10,375 MiB the card holds is the 5.71 GiB of dense weights, the staging buffer, the scratch, the drafter and the CUDA context |
+  | a hot set that expert cache can hold | flat routing (sqrtsoftplus scores plus the learned `exp_probs_b` bias over 256 experts): 0 cross-window cache hits out of 20,741 reads, so a resident set captures only its share - the 14,092 MiB free on this card is 18% of the file |
+  | the 28.8 GB n-gram (PLE) table, 16 row reads per token, and prompt lookup over the context | no such table exists: layers 0-2 route by a token-id hash, layers 3-42 through `ffn_gate_inp` |
+  | the model's own MTP draft layer, 2.4-3.2 tokens per pass | a separate drafter whose verify asks for the same bytes: +5.8% on the 3090 (59,046.4 -> 55,632.5 ms) |
+  | `--peer-device`, `--layer-split`, `--expert-cache-device1..3` | no CUDA device is ever named, so the serve path is one card |
+
+  "Fewer bytes per token" is not available either: UD-IQ2_XXS is already the smallest quantization of this family.
+  What would change the verdict is a card that holds the 78.11 GiB, or an architecture whose experts are small
+  enough to be resident - which is the question P5 (GLM-5.3-Flash) would have to answer before any of P1-P4 is
+  repeated for it.
+
+  The state of the work: `main` carries none of it (no `dsv4`/`dspark`/`dflash` file is in that tree); the engine,
+  the pack, the drafter, the residency option and every number in this document live on the `dsv4` branch
+  (`origin/dsv4`). `setup.py` on that branch offers the family as EXPERIMENTAL and says what to expect of it.
+  This box no longer holds the packs - `packs/dsv4-ud-iq2_xxs` (78.35 GiB) and `packs/dspark-q8_0` (9.70 GiB)
+  were deleted on 2026-10-05 and the GGUFs were kept; rebuilding them is `tools/iq_pack.py`'s deepseek4 mode.
+
 ## Reproducing the P0 dump
 
 ```
