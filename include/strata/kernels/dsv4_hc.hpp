@@ -52,4 +52,9 @@ void hc_post_combine(const float* a, const float* res, const float* post, const 
 void hc_head_pre(const float* mixes, const float* scale, const float* base, float* pre, int64_t n,
                  int64_t hc, float eps, void* stream);
 
+/// `out[m][d] = mean_h x[m][h][d]` - the DSpark drafter's capture of the target (llama.cpp's
+/// `build_hc_mean`, docs/DSV4.md P4): the drafter's `fc` consumes the mean over the hc streams of
+/// the target's last three layer outputs, NOT a stream or the collapsed head.
+void hc_mean(const float* x, int64_t m, int64_t hc, int64_t d, float* out, void* stream);
+
 }  // namespace strata::kernels

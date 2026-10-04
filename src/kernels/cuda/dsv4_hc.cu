@@ -184,4 +184,23 @@ void hc_head_pre(const float* mixes, const float* scale, const float* base, floa
     sync_if_needed(stream, "hc_head_pre");
 }
 
+// The DSpark drafter's view of the target: llama.cpp's deepseek4 graph exposes each captured layer's
+// hidden state as `build_hc_mean(inpL)` - the mean over the hc streams (docs/DSV4.md P4).  The
+// drafter's fc consumes exactly those, so this is the capture the target's forward must offer.
+__global__ void hc_mean_kernel(const float* __restrict__ x, int64_t hc, int64_t d,
+                               float* __restrict__ out) {
+    const int64_t m = blockIdx.x;
+    for (int64_t j = blockIdx.y * blockDim.x + threadIdx.x; j < d; j += (int64_t) blockDim.x * gridDim.y) {
+        float s = 0.0f;
+        for (int64_t h = 0; h < hc; ++h) s += x[(m * hc + h) * d + j];
+        out[m * d + j] = s / (float) hc;
+    }
+}
+
+void hc_mean(const float* x, int64_t m, int64_t hc, int64_t d, float* out, void* stream) {
+    hc_mean_kernel<<<dim3((unsigned) m, 4), 256, 0, (cudaStream_t) stream>>>(x, hc, d, out);
+    check_launch("hc_mean");
+    sync_if_needed(stream, "hc_mean");
+}
+
 }  // namespace strata::kernels

@@ -71,10 +71,14 @@ int64_t dsv4_attn_prefill_scratch_bytes(const ModelGeometry& g, int64_t layer, i
 
 /// `n` tokens through the attention half at positions `pos0..pos0+n-1`.  Streams are
 /// token-major [n][hc * n_embd] f32; `n_stage` bounds each query's scored columns.
+/// `carry_snap`, when set, is device [n][carry_floats + idx_carry_floats] and receives the
+/// compressor/indexer carries as they stand AFTER each token - the speculative verify window's
+/// per-position rollback point (docs/DSV4.md P4).
 bool dsv4_attn_prefill_step(const ModelGeometry& g, int64_t layer, const Dsv4AttnWeights& w,
                             Dsv4LayerState& st, const float* stream_in, float* stream_out,
                             int64_t pos0, int64_t n, int64_t n_stage, float* scratch,
-                            void* cu_stream);
+                            void* cu_stream, float* carry_snap = nullptr,
+                            int64_t carry_stride = 0);
 
 /// One decode token through the attention half.  `stream_in`/`stream_out` are [hc * n_embd] f32
 /// (they may alias nothing else); `n_stage` bounds the compressed staging (the caller passes the

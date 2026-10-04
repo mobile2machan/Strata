@@ -992,6 +992,10 @@ class Service:
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # DeepSeek-V4's turn ends at its own EOS, not at an im_end marker its template never emits
+        # (docs/DSV4.md P3); a Qwen3.8 vocab has no such token, so its stop set stays exactly as it was.
+        if "<｜end▁of▁sentence｜>" in getattr(tokenizer, "tokens", []):
+            self.stop_ids |= set(tokenizer.encode("<｜end▁of▁sentence｜>", parse_special=True))
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -1337,6 +1341,11 @@ class Service:
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
+        if "bos_token" in self.template.variables and "bos_token" not in kwargs:
+            # DeepSeek-V4's template renders the BOS token itself (docs/DSV4.md P3); the tokenizer carries its
+            # id from the GGUF metadata.  A template that never names the variable (Qwen3.8's) is untouched.
+            bid = self.tok.special_ids.get("tokenizer.ggml.bos_token_id")
+            kwargs = {**kwargs, "bos_token": self.tok.tokens[bid] if bid is not None else ""}
         prompt = self.template.render(messages, tools=tools, **kwargs)
         ids = self.tok.encode(prompt, parse_special=True)
         self.embeddings.path = None
@@ -1389,7 +1398,14 @@ class Service:
                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
                                  "model's strata-<model>.json to shorten it to the room left (#545)")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        # whether the reply opens in a thinking block: the key the template's dialect spells it with, and that
+        # dialect's default when the request said nothing (Qwen3.8's template thinks unless told not to;
+        # DeepSeek-V4's defaults to thinking=false and only our effort mapping turns it on).
+        if self.template.dialect == "dsv4":
+            thinking = kwargs.get("thinking", False) is not False
+        else:
+            thinking = kwargs.get("enable_thinking", True) is not False
+        return ids, thinking, max_new
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -2412,7 +2428,7 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
-            messages, tools, kw = openai_to_messages(req)
+            messages, tools, kw = openai_to_messages(req, svc.template.dialect)
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
@@ -2470,14 +2486,14 @@ def make_handler(svc: Service):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, svc.template.dialect)
             prompt = svc.template.render(messages, tools=tools, **kw)
             self._json(200, {"input_tokens": len(svc.tok.encode(prompt, parse_special=True))})
 
         def _anthropic(self, req):
             svc.load()
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, svc.template.dialect)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
@@ -2889,7 +2905,10 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        # the pack's tokenizer.json carries the model's pre-tokenizer type and its special ids; a pack
+        # predating that file is qwen35 with no specials, as this call always was
+        cfgt = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8")) if (tpath / "tokenizer.json").exists() else {}
+        tok = ST.Tokenizer(tokens, merges, types, pre=cfgt.get("pre", "qwen35"), special_ids=cfgt.get("special_ids"))
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:

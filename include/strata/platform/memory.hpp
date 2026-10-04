@@ -5,7 +5,6 @@
 // it instead: raise the process's minimum working set by the region's size, then VirtualLock it (Windows needs
 // only SeIncreaseWorkingSetPrivilege, which ordinary accounts hold). Linux: mlock.
 #pragma once
-
 #include <cstdint>
 #include <string>
 
@@ -31,5 +30,9 @@ bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usag
 
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
+
+/// Physical RAM no process is using right now (0 when unknown).  Used to size a host mirror of a model's weights
+/// so filling it does not push the machine into its page file.
+uint64_t available_physical_memory();
 
 }  // namespace strata::platform

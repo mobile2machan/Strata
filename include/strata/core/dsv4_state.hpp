@@ -62,10 +62,23 @@ public:
     Dsv4LayerState& layer(int64_t l) { return layers_[(size_t) l]; }
     const Dsv4LayerState& layer(int64_t l) const { return layers_[(size_t) l]; }
 
+    /// The compressor/indexer carry registers, all layers, as one flat buffer (docs/DSV4.md P4).
+    /// A speculative verify advances them per token; the window ring and the compressed pool are
+    /// position-keyed and self-heal when a rejected position is rewritten, but the carries are a
+    /// rolling register - they are the only part of the state a rollback has to restore.
+    int64_t carry_bytes() const { return carry_total_; }
+    /// Where one layer's carries sit in the flat snapshot buffer (the same span `carry_save` copies).
+    int64_t carry_offset(int64_t l) const { return carry_off_[(size_t) l]; }
+    void carry_save(void* dst) const;
+    void carry_restore(const void* src) const;
+
 private:
     std::vector<Dsv4LayerState> layers_;
     void* arena_ = nullptr;
     size_t arena_bytes_ = 0;
+    std::vector<int64_t> carry_off_;      ///< per layer, the byte offset of its carries in the flat buffer
+    std::vector<int64_t> carry_len_;      ///< per layer, ks+ss (+iks+iss) bytes
+    int64_t carry_total_ = 0;
 };
 
 // ---- addressing (pure arithmetic; the layer and its tests share these) ----

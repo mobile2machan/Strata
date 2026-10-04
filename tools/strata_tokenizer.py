@@ -55,13 +55,36 @@ UNICODE_TO_BYTE = {v: k for k, v in BYTE_TO_UNICODE.items()}
 # never forms.  It cost 3 strings out of 1875 and only `tokenize_oracle_check` could see it.
 QWEN35_PATTERN = (
     r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
-    r"|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+"
+    r"|[^\r\n\p{L}\p{M}]?[\p{L}\p{M}]+"
     r"|\p{N}"
     r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*"
     r"|\s*[\r\n]+"
     r"|\s+(?!\S)"
     r"|\s+"
 )
+
+# The `joyai-llm` pre-tokenizer (DeepSeek-V4-Flash, docs/DSv4.md P3), transcribed from
+# `.ref/llama.cpp src/llama-vocab.cpp`, `case LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM` - the same three
+# patterns DEEPSEEK3_LLM, HUNYUAN_DENSE and HY_V4 share.  Unlike every pattern above this is a
+# LIST: llama.cpp's unicode_regex_split() applies the patterns IN ORDER, each one cutting up the
+# pieces the previous one left, and the gaps between matches stay as pieces.  A single combined
+# alternation is NOT the same thing (it would let the letter pattern swallow digits and CJK), so
+# `_split_pieces` below mirrors the sequential split rather than flattening the list.
+JOYAI_LLM_PATTERNS = (
+    r"\p{N}{1,3}",
+    r"[一-龥぀-ゟ゠-ヿ]+",
+    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+"
+    r"|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+    r"| ?[\p{P}\p{S}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+",
+)
+
+PRE_PATTERNS: dict[str, tuple[str, ...]] = {
+    "qwen35": (QWEN35_PATTERN,),
+    "joyai-llm": JOYAI_LLM_PATTERNS,
+}
 
 
 class Tokenizer:
@@ -86,7 +109,10 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        pats = PRE_PATTERNS.get(pre)
+        if pats is None:
+            raise ValueError("unknown pre-tokenizer %r; known: %s" % (pre, ", ".join(sorted(PRE_PATTERNS))))
+        self._res = [regex.compile(p) for p in pats]
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -202,9 +228,28 @@ class Tokenizer:
                     heapq.heappush(heap, (r2, p, parts[p], parts[i]))
         return [s for s in parts if s is not None]
 
+    def _split_pieces(self, text: str) -> list[str]:
+        """llama.cpp's sequential split: each pattern cuts up the pieces the previous one left,
+        and the gaps between matches stay pieces (a pattern that matches nothing leaves its
+        input untouched).  For a single exhaustive pattern this is what `findall` already did."""
+        pieces = [text]
+        for re in self._res:
+            nxt: list[str] = []
+            for p in pieces:
+                pos = 0
+                for m in re.finditer(p):
+                    if m.start() > pos:
+                        nxt.append(p[pos:m.start()])
+                    nxt.append(m.group(0))
+                    pos = m.end()
+                if pos < len(p):
+                    nxt.append(p[pos:])
+            pieces = nxt
+        return [p for p in pieces if p]
+
     def _encode_plain(self, text: str) -> list[int]:
         out: list[int] = []
-        for piece in self._re.findall(text):
+        for piece in self._split_pieces(text):
             mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
             for tok in self._bpe(mapped):
                 i = self.ids.get(tok)
@@ -274,10 +319,12 @@ def extract(gguf_path, out_dir) -> dict:
         "n_merges": len(tk.ranks),
         "special_ids": tk.special_ids,
         "add_bos_token": False,
-        # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
-        # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        # The patterns are SHIPPED, not recomputed by the reader: they are transcribed from llama.cpp for
+        # the declared `pre` type, and a C++ port that re-derived them would be free to get `\p{M}` wrong
+        # again.  A list, because `joyai-llm` is a sequential multi-pattern split (see JOYAI_LLM_PATTERNS).
+        "pre_patterns": list(PRE_PATTERNS[tk.pre]),
+        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_%s)"
+                              % tk.pre.upper().replace("-", "_"),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in

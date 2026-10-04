@@ -93,7 +93,10 @@ KIND = {"BF16": "4", "F16": "5", "F32": "2"}
 # engine reads it (norms, compressor APE and mHC as F32; routers as BF16), there is no PLE table, and every
 # quantized projection - plus the I32 hash tables (ffn_gate_tid2eid) - is served natively from the GGUF.
 # Nothing is converted, so FORM stays empty; main() swaps the tables in when the shard says deepseek4.
+# dflash (the DSpark drafter, docs/DSV4.md P4) is the same story: Q8_0/MXFP4 projections served natively,
+# F32 norms and mHC and BF16 router/Markov/confidence tensors stored as they are.
 DSV4_ARCH = "deepseek4"
+DFLASH_ARCH = "dflash"
 
 
 def form_of(name: str):
@@ -526,11 +529,11 @@ def main() -> int:
 
     g = G.GGUFFile(src)
     arch = str(g.metadata.get("general.architecture", ""))
-    if arch == DSV4_ARCH:
+    if arch in (DSV4_ARCH, DFLASH_ARCH):
         global FORM, NOT_IN_PACK, NATIVE_PLE_KEY
         FORM, NOT_IN_PACK, NATIVE_PLE_KEY = {}, set(), set()
         if a.base:
-            ap.error("--base is the Q2_0 Qwen pack; deepseek4 has no canonical base to reuse")
+            ap.error("--base is the Q2_0 Qwen pack; deepseek4/dflash has no canonical base to reuse")
     mm = np.memmap(src, dtype=np.uint8, mode="r")
     model = Model(src)
     if len(model.paths) > 1:
@@ -581,16 +584,16 @@ def main() -> int:
         rc = index_standalone(src, out, model, a.compat_bf16)
     if rc:
         return rc
-    if arch == DSV4_ARCH:
-        # the deepseek4 tokenizer (pre = joyai-llm) is docs/DSV4.md P3; the pack itself is complete without it
-        print("tokenizer: not exported for deepseek4 yet (docs/DSV4.md P3)")
-    elif not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
+    if arch != DFLASH_ARCH and (not (out / "tokenizer" / "vocab.json").exists() or
+                                not (out / "tokenizer" / "chat_template.jinja").exists()):
+        # dflash packs skip this: the drafter ships no usable tokenizer (it borrows the target's), and
+        # strata_tokenizer.py would only write a second, unused one.
         subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
                        check=True)   # writes <out>/tokenizer/
 
-    if arch == DSV4_ARCH:
-        # the geometry the engine's deepseek4 reader (docs/DSV4.md P2) needs, from shard 1's metadata;
-        # the heavy tokenizer arrays belong to P3 and are left out
+    if arch in (DSV4_ARCH, DFLASH_ARCH):
+        # the geometry the engine's deepseek4/dflash reader (docs/DSV4.md P2/P4) needs, from shard 1's
+        # metadata; the heavy tokenizer arrays belong to P3 and are left out
         heavy = {"tokenizer.ggml.tokens", "tokenizer.ggml.scores", "tokenizer.ggml.merges",
                  "tokenizer.ggml.token_type", "tokenizer.chat_template", "tokenizer.ggml.added_tokens",
                  "tokenizer.ggml.pre"}

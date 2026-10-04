@@ -57,6 +57,17 @@ def _write_fixture(root):
     w1.add_uint32("deepseek4.expert_used_count", 2)
     w1.add_uint32("deepseek4.hash_layer_count", 1)
     w1.add_array("deepseek4.attention.compress_ratios", [0, 4])
+    # a minimal tokenizer: the packer exports tokenizer/ from shard 1 (tools/strata_tokenizer.py), and
+    # model.json must still leave the heavy arrays out
+    toks = ["<s>", "</s>", "<pad>", "a", "b"] + ["t%03d" % i for i in range(VOCAB - 5)]
+    w1.add_tokenizer_model("gpt2")
+    w1.add_token_list(toks)
+    w1.add_token_merges(["a b"])
+    w1.add_tokenizer_pre("joyai-llm")
+    w1.add_bos_token_id(0)
+    w1.add_eos_token_id(1)
+    w1.add_pad_token_id(2)
+    w1.add_chat_template("{% for m in messages %}{{ m.content }}{% endfor %}")
     w1.write_header_to_file()
     w1.write_kv_data_to_file()
     w1.write_tensors_to_file()
@@ -126,7 +137,6 @@ class Dsv4PackTests(unittest.TestCase):
                 self.assertEqual(int(f[4]), BLOB)
                 self.assertEqual(f[8], s2.name)
             self.assertIn("model.json", log)
-            self.assertIn("not exported for deepseek4 yet", log)
 
             # the arena is the source bytes, relaid as [gate | up | down] per expert
             arena = (out / "experts.bin").read_bytes()
@@ -164,6 +174,17 @@ class Dsv4PackTests(unittest.TestCase):
             self.assertEqual(man["metadata"]["deepseek4.block_count"], 2)
             self.assertEqual(man["metadata"]["deepseek4.attention.compress_ratios"], [0, 4])
             self.assertNotIn("tokenizer.ggml.tokens", man["metadata"])
+
+            # tokenizer/: exported from shard 1 by tools/strata_tokenizer.py, with the pre-tokenizer type,
+            # the special ids and the chat template the server (P3) reads
+            tk_dir = out / "tokenizer"
+            self.assertEqual(json.loads((tk_dir / "vocab.json").read_text(encoding="utf-8"))["<s>"], 0)
+            tcfg = json.loads((tk_dir / "tokenizer.json").read_text(encoding="utf-8"))
+            self.assertEqual(tcfg["pre"], "joyai-llm")
+            self.assertEqual(tcfg["special_ids"], {"tokenizer.ggml.bos_token_id": 0,
+                                                  "tokenizer.ggml.eos_token_id": 1,
+                                                  "tokenizer.ggml.padding_token_id": 2})
+            self.assertIn("m.content", (tk_dir / "chat_template.jinja").read_text(encoding="utf-8"))
 
     def test_hash_layer_without_router_still_packs_expert_count_from_tensors(self):
         # the fixture's layer 0 has no ffn_gate_inp; the count must come from the expert tensors

@@ -199,6 +199,13 @@ struct PScratch {
     uint8_t* fq;    // n q8_1 columns of n_ff
     float* part;    // [dim] one (token, expert) down output
     float* y2;      // [n][dim]
+    uint8_t* grp_xq;  // [max_entries] q8_1 columns of dim, gathered for one expert group
+    float* grp_gg;    // [max_entries][n_ff] gate for one expert group
+    float* grp_gu;    // [max_entries][n_ff] up for one expert group
+    float* grp_ff;    // [max_entries][n_ff] SwiGLU output for one expert group
+    uint8_t* grp_fq;  // [max_entries] q8_1 columns of n_ff for one expert group
+    float* grp_out;   // [max_entries][dim] down output for one expert group
+    float* exp_out;   // [n*topk][dim] down outputs in original pick order
 };
 
 PScratch pcarve(Cursor& c, const ModelGeometry& g, int64_t n) {
@@ -220,6 +227,14 @@ PScratch pcarve(Cursor& c, const ModelGeometry& g, int64_t n) {
     s.fq = c.take<uint8_t>(n * q8_1_bytes(g.n_ff));
     s.part = c.take<float>(g.n_embd);
     s.y2 = c.take<float>(n * g.n_embd);
+    const int64_t max_entries = n * k;
+    s.grp_xq = c.take<uint8_t>(max_entries * q8_1_bytes(g.n_embd));
+    s.grp_gg = c.take<float>(max_entries * g.n_ff);
+    s.grp_gu = c.take<float>(max_entries * g.n_ff);
+    s.grp_ff = c.take<float>(max_entries * g.n_ff);
+    s.grp_fq = c.take<uint8_t>(max_entries * q8_1_bytes(g.n_ff));
+    s.grp_out = c.take<float>(max_entries * g.n_embd);
+    s.exp_out = c.take<float>(max_entries * g.n_embd);
     return s;
 }
 
@@ -281,20 +296,71 @@ bool dsv4_ffn_prefill_step(const ModelGeometry& g, int64_t layer, const Dsv4FfnW
         staged = true;
     }
     const int64_t xq_col = q8_1_bytes(dim), fq_col = q8_1_bytes(ff);
-    for (int64_t t = 0; t < n; ++t) {
-        for (int64_t e = 0; e < k; ++e) {
-            const int64_t p = t * k + e;
-            const uint8_t* blob = base + (staged ? p : (int64_t) h_ids[(size_t) p]) * w.experts.bytes;
-            kernels::iq_mmvq(w.experts.gu_type, blob, s.xq + t * xq_col, s.gg + t * ff, (int) dim,
-                             (int) ff, 1, cu);
-            kernels::iq_mmvq(w.experts.gu_type, blob + w.experts.up_off, s.xq + t * xq_col,
-                             s.gu + t * ff, (int) dim, (int) ff, 1, cu);
-            kernels::dsv4_swiglu(s.gg + t * ff, s.gu + t * ff, s.ff + t * ff, ff, gu_limit, cu);
-            kernels::quantize_q8_1_rows(s.ff + t * ff, 1, ff, s.fq + t * fq_col, cu);
-            kernels::iq_mmvq(w.experts.d_type, blob + w.experts.down_off, s.fq + t * fq_col, s.part,
-                             (int) ff, (int) dim, 1, cu);
-            kernels::scale_inplace(s.part, dim, h_rw[(size_t) p], cu);
-            kernels::add_inplace(s.y2 + t * dim, s.part, dim, cu);
+    const int64_t total = n * k;
+    const bool allow_grouped = std::getenv("STRATA_DSV4_GROUPED") == nullptr;
+    bool has_dup = false;
+    for (int64_t p = 1; p < total && !has_dup; ++p)
+        for (int64_t q = 0; q < p; ++q)
+            if (h_ids[(size_t) p] == h_ids[(size_t) q]) { has_dup = true; break; }
+    if (has_dup && allow_grouped) {
+        struct Group { int32_t id; int32_t first_p; std::vector<int32_t> entries; };
+        static thread_local std::vector<Group> groups;
+        groups.clear();
+        for (int64_t p = 0; p < total; ++p) {
+            const int32_t id = h_ids[(size_t) p];
+            int gi = -1;
+            for (int i = 0; i < (int) groups.size(); ++i)
+                if (groups[(size_t) i].id == id) { gi = i; break; }
+            if (gi < 0) {
+                groups.push_back(Group{id, (int32_t) p, {}});
+                gi = (int) groups.size() - 1;
+            }
+            groups[(size_t) gi].entries.push_back((int32_t) p);
+        }
+        for (const auto& gr : groups) {
+            const int m = (int) gr.entries.size();
+            const uint8_t* blob =
+                base + (staged ? (int64_t) gr.first_p : (int64_t) h_ids[(size_t) gr.first_p]) * w.experts.bytes;
+            for (int idx = 0; idx < m; ++idx) {
+                const int64_t p = gr.entries[(size_t) idx];
+                const int64_t t = p / k;
+                cudaMemcpyAsync(s.grp_xq + (size_t) idx * xq_col, s.xq + (size_t) t * xq_col,
+                                (size_t) xq_col, cudaMemcpyDeviceToDevice, (cudaStream_t) cu);
+            }
+            kernels::iq_mmvq(w.experts.gu_type, blob, s.grp_xq, s.grp_gg, (int) dim, (int) ff, m, cu);
+            kernels::iq_mmvq(w.experts.gu_type, blob + w.experts.up_off, s.grp_xq, s.grp_gu, (int) dim,
+                             (int) ff, m, cu);
+            kernels::dsv4_swiglu(s.grp_gg, s.grp_gu, s.grp_ff, (int64_t) m * ff, gu_limit, cu);
+            kernels::quantize_q8_1_rows(s.grp_ff, m, ff, s.grp_fq, cu);
+            kernels::iq_mmvq(w.experts.d_type, blob + w.experts.down_off, s.grp_fq, s.grp_out, (int) ff,
+                             (int) dim, m, cu);
+            for (int idx = 0; idx < m; ++idx) {
+                const int64_t p = gr.entries[(size_t) idx];
+                cudaMemcpyAsync(s.exp_out + (size_t) p * dim, s.grp_out + (size_t) idx * dim,
+                                (size_t) dim * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) cu);
+            }
+        }
+        for (int64_t p = 0; p < total; ++p) {
+            const int64_t t = p / k;
+            kernels::scale_inplace(s.exp_out + (size_t) p * dim, dim, h_rw[(size_t) p], cu);
+            kernels::add_inplace(s.y2 + (size_t) t * dim, s.exp_out + (size_t) p * dim, dim, cu);
+        }
+    } else {
+        for (int64_t t = 0; t < n; ++t) {
+            for (int64_t e = 0; e < k; ++e) {
+                const int64_t p = t * k + e;
+                const uint8_t* blob = base + (staged ? p : (int64_t) h_ids[(size_t) p]) * w.experts.bytes;
+                kernels::iq_mmvq(w.experts.gu_type, blob, s.xq + t * xq_col, s.gg + t * ff, (int) dim,
+                                 (int) ff, 1, cu);
+                kernels::iq_mmvq(w.experts.gu_type, blob + w.experts.up_off, s.xq + t * xq_col,
+                                 s.gu + t * ff, (int) dim, (int) ff, 1, cu);
+                kernels::dsv4_swiglu(s.gg + t * ff, s.gu + t * ff, s.ff + t * ff, ff, gu_limit, cu);
+                kernels::quantize_q8_1_rows(s.ff + t * ff, 1, ff, s.fq + t * fq_col, cu);
+                kernels::iq_mmvq(w.experts.d_type, blob + w.experts.down_off, s.fq + t * fq_col, s.part,
+                                 (int) ff, (int) dim, 1, cu);
+                kernels::scale_inplace(s.part, dim, h_rw[(size_t) p], cu);
+                kernels::add_inplace(s.y2 + t * dim, s.part, dim, cu);
+            }
         }
     }
 

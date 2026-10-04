@@ -108,6 +108,12 @@ uint64_t total_physical_memory() {
     ms.dwLength = sizeof ms;
     return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullTotalPhys : 0;
 }
+
+uint64_t available_physical_memory() {
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullAvailPhys : 0;
+}
 #else
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
@@ -131,6 +137,11 @@ bool gpu_shared_memory_budget(const void*, uint64_t& budget, uint64_t& usage, st
 
 uint64_t total_physical_memory() {
     const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
+    return pages > 0 && page > 0 ? (uint64_t) pages * (uint64_t) page : 0;
+}
+
+uint64_t available_physical_memory() {
+    const long pages = sysconf(_SC_AVPHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
     return pages > 0 && page > 0 ? (uint64_t) pages * (uint64_t) page : 0;
 }
 #endif

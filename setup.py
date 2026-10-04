@@ -67,6 +67,7 @@ HF_REVISIONS = {
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "b22d729eae29b5796f76fb70f91aef549b9fc52c",   # 2026-09-24
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
+    "unsloth/DeepSeek-V4-Flash-0731-GGUF": "fbbb5b93fb787c21338159b0af3318bb3f4d9768",                # 2026-08-06
 }
 
 
@@ -128,6 +129,16 @@ MODELS = {
     "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but most experts come from the "
                             "SSD on a 64 GB PC (7-8.5 tokens/s measured)", "download_gb": 111.3, "ram_gb": 48,
                    "arena_gb": 77.0, "families": ("unsloth",), "budget": True},
+    # DeepSeek-V4-Flash (docs/DSV4.md): a different architecture (deepseek4); the pack keeps its experts in
+    # experts.bin and the engine reads the artifact's metadata shard (shard 1) for the geometry.  The arena is
+    # measured for UD-IQ2_XXS (83.9 GB of experts.bin from the 90.9 GB file); UD-IQ3_XXS is the same 92% ratio
+    # of its 104.2 GB file, not yet built.  No drafter yet (P4), so ~1 s/token (measured, docs/DSV4.md).
+    "UD-IQ2_XXS": {"about": "2-bit (Unsloth Dynamic), EXPERIMENTAL: needs a 110+ GB PC; ~1 s/token until the "
+                             "drafter lands", "download_gb": 90.9, "ram_gb": 110, "arena_gb": 83.9,
+                   "families": ("dsv4",), "shards": 3},
+    "UD-IQ3_XXS": {"about": "3-bit (Unsloth Dynamic), EXPERIMENTAL: needs a 128+ GB PC; ~1 s/token until the "
+                             "drafter lands", "download_gb": 104.2, "ram_gb": 128, "arena_gb": 96.0,
+                   "families": ("dsv4",), "shards": 4},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
@@ -140,6 +151,25 @@ UNSLOTH_SHARDS = {
         (49376141504, "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3"),
     "Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf":
         (12087983520, "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a"),
+}
+# The DeepSeek-V4-Flash shards at the pinned revision (docs/DSV4.md): the UD-IQ2_XXS hashes are computed from
+# the local files; the UD-IQ3_XXS ones are the repository's LFS oids (the same sha256, as verified for the
+# UD-IQ2_XXS files against their local bytes).
+DSV4_SHARDS = {
+    "DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00001-of-00003.gguf":
+        (5257664, "c58c9d62eac7b62e9578b52613f425e48313d7212ab8d1d76caed8ea8de26595"),
+    "DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00002-of-00003.gguf":
+        (49890588800, "65a113df6d4469f16db6882b6919e153c464c3c78c833f5e1b41a33803cdbd52"),
+    "DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00003-of-00003.gguf":
+        (40964890464, "a69102ddfaf4a84426e11fdb66716654f4260dc3a1de3ade9fd50e006b8691d3"),
+    "DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf":
+        (5257696, "dec1cee704800267d9d836d5a61aefc33705be939bbb3058fa9006d98191576d"),
+    "DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00002-of-00004.gguf":
+        (49910532416, "3064d3c4c1d6363e9f9ad88e90a3e2c5fb2d6f7ae16ca72135c3ce6a5c984da5"),
+    "DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00003-of-00004.gguf":
+        (49257859456, "2e9b2732eca7da8324f731653624a4f5c9846258926fd9f468cc703afb51a019"),
+    "DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00004-of-00004.gguf":
+        (5034198464, "4ca79d8e5107dd1b9bb57b176a7c09948837425dee49f0f1dfd6547a3769fea7"),
 }
 UNSLOTH_ENGINE = (0, 1, 32)     # the first engine setup configures for UD-Q4_K_XL (0.1.31 ran it by hand)
 UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
@@ -181,6 +211,15 @@ FAMILIES = {
                 "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
                 "experimental": True, "vision": False, "pack_args": ["--compat-bf16"], "sha256": UNSLOTH_SHARDS},
+    # DeepSeek-V4-Flash (docs/DSV4.md): a different architecture (deepseek4), not a Qwen3.8 variant: no PLE table,
+    # no MTP draft layer (the drafter is P4), no vision.  The engine reads the metadata shard (shard 1) itself;
+    # the pack keeps its experts in experts.bin (always, the only way the engine reads them for this family).
+    "dsv4": {"title": "DeepSeek-V4-Flash", "by": "DeepSeek; the UD quants by Unsloth (EXPERIMENTAL)",
+             "about": "the 43-layer DeepSeek-V4 MoE: ~1 s/token (no drafter yet); needs a 110+ GB PC",
+             "hf": hf("unsloth/DeepSeek-V4-Flash-0731-GGUF") + "{q}/",
+             "file": "DeepSeek-V4-Flash-0731-{q}-0000{i}-of-0000{n}.gguf", "tag": "dsv4-",
+             "name": "deepseek-v4-flash", "experimental": True, "vision": False,
+             "pack_args": ["--experts-bin"], "sha256": DSV4_SHARDS},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -849,12 +888,18 @@ def whole_shard(s: Path) -> bool:
 SHARD_NAME = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
 
+def shard_count(fam: dict, model: str) -> int:
+    """How many shards this model's files are split into: the size's own count (the DeepSeek-V4 UD quants: 3 or 4),
+    else the family's, else 2 (the Qwen originals).  The {n} in a family's file pattern is filled from here."""
+    return MODELS.get(model, {}).get("shards", fam.get("shards", 2))
+
+
 def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
     """--gguf-dir's shards (#305): every -0000i-of-0000N file of the model, N read from the first shard's name as the
     engine and tools/iq_pack.py do.  The published name first; else the one first shard in the folder whose name has
     the size in it (an upload split or named differently: -00001-of-00003, Unsloth's ...-00001-of-00004.gguf).  A
     missing shard is check_shards' error later, as before."""
-    first = folder / fam["file"].format(q=model, i=1)
+    first = folder / fam["file"].format(q=model, i=1, n=shard_count(fam, model))
     if not first.exists():
         found = sorted(p for p in folder.glob("*-00001-of-*.gguf") if SHARD_NAME.search(p.name))
         mine = [p for p in found if model.lower() in p.name.lower()]
@@ -873,14 +918,29 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
 GGUF_QUANT = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d+(?:_[A-Za-z0-9]+)*|BF16|F16|F32))"
                         r"(?=-\d{5}-of-\d{5}\.gguf$|\.gguf$)", re.I)
 SUPPORTED_GGUFS = ("Strata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next Q2_0, IQ2_XS, IQ3_XXS, IQ3_S; Swift "
-                   "1.5's; the Coder's IQ1_M) and Unsloth's UD-Q4_K_XL only: other GGUFs (Unsloth's UD-IQ3_XXS or "
-                   "UD-Q2_K_XL, K-quants) cannot be used")
+                   "1.5's; the Coder's IQ1_M), Unsloth's UD-Q4_K_XL only, and the DeepSeek-V4-Flash UD quants "
+                   "(UD-IQ2_XXS, UD-IQ3_XXS): other GGUFs (Unsloth's UD-Q2_K_XL, K-quants) cannot be used")
 
 
 def gguf_unsupported(name: str) -> str | None:
-    """#444: the quantization a GGUF's name says, when it is one Strata cannot run (not a setup size); else None."""
+    """#444: the quantization a GGUF's name says, when it is one Strata cannot run (not a setup size); else None.
+    A name that starts with a family's published file-name prefix is that family's file, and the size has to be
+    one it publishes: Qwen3.8-Flash-Next-UD-IQ3_XXS is Unsloth's naming and Unsloth has no UD-IQ3_XXS, even though
+    that size exists for DeepSeek-V4.  The longest matching prefix wins (the GSQ-RCO names start with the plain
+    Unsloth prefix too); a name matching no prefix is judged by its quant alone, so a renamed file still works."""
     m = GGUF_QUANT.search(name)
-    return m.group(1) if m and m.group(1).upper() not in MODELS and not name.lower().startswith("mmproj") else None
+    if not m or name.lower().startswith("mmproj"):
+        return None
+    q = m.group(1).upper()
+    bases = sorted(((d["file"].split("{q}")[0], f) for f, d in FAMILIES.items()), key=lambda x: -len(x[0]))
+    for base, f in bases:
+        if name.startswith(base):
+            if f in MODELS.get(q, {}).get("families", ()):
+                return None
+            # the name may still be another family's published file (the Coder's IQ1_M is named like the
+            # original's sizes): flag it only when no family publishes this exact name
+            return None if gguf_choice(name) else q
+    return None if q in MODELS else q
 
 
 def gguf_choice(name: str) -> tuple | None:
@@ -888,7 +948,8 @@ def gguf_choice(name: str) -> tuple | None:
     the original's sizes: the size tells them apart)."""
     for f, d in FAMILIES.items():
         for m in MODELS:
-            if f in MODELS[m].get("families", ("qwen", "swift")) and name == d["file"].format(q=m, i=1):
+            if f in MODELS[m].get("families", ("qwen", "swift")) and name == d["file"].format(
+                    q=m, i=1, n=shard_count(d, m)):
                 return f, m
     return None
 
@@ -2170,13 +2231,20 @@ def confirm_paging(model, ram, choice, yes, explicit_model=False):
     already made."""
     need_gb, arena = MODELS[model]["ram_gb"], MODELS[model]["arena_gb"]
     off = choice == "off"
+    # the smaller sizes of this model's own family (DeepSeek-V4 has none: the wording says so)
+    fams = MODELS[model].get("families", ("qwen", "swift"))
+    smaller = sorted((m for m in MODELS
+                      if any(f in MODELS[m].get("families", ("qwen", "swift")) for f in fams)
+                      and MODELS[m]["ram_gb"] < need_gb), key=lambda m: MODELS[m]["ram_gb"])[:2]
+    fits = ("A smaller size (" + " or ".join(smaller) + ") fits; more RAM fixes it." if smaller
+            else "This model has no smaller size; more RAM fixes it.")
+    choose = ("choose " + " or ".join(smaller) + ", or add RAM" if smaller else "add RAM")
     confirm_risk(f"{model} needs about {need_gb} GB of RAM and this PC has {ram:.0f} GB: its experts alone are "
                  f"{arena:.0f} GB and must stay in RAM, so Windows/Linux will page part of them from disk. Expect it "
-                 "to be much slower, and it may not start at all.\n       A smaller size (Q2_0 or IQ2_XS) fits; more "
-                 "RAM fixes it.", off or explicit_model, yes,
+                 f"to be much slower, and it may not start at all.\n       {fits}", off or explicit_model, yes,
                  f"{model} needs about {need_gb} GB of RAM; this PC has {ram:.0f} GB",
-                 "choose Q2_0 or IQ2_XS, or add RAM" + ("" if off else f"; or --model {model} --yes (or --low-ram off "
-                                                                        "--yes) to install it anyway"),
+                 choose + ("" if off else f"; or --model {model} --yes (or --low-ram off "
+                                         "--yes) to install it anyway"),
                  "  Install it anyway?", "y" if off else "n")
     warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose" + (" (--low-ram off)" if off else
                                                                           " (--model)" if explicit_model else ""))
@@ -2473,6 +2541,20 @@ def engine_version(exe: Path) -> tuple:
         except OSError:
             v = "0"
     return tuple(int(x) for x in v.split(".")[:3] if x.isdigit())
+
+
+def engine_has_arg(exe: Path, flag: str) -> bool:
+    """Whether this engine binary knows `flag` (asked of its own help).  The version alone cannot say: a serve
+    path or an option can be in this checkout and not in the published ready-made engine."""
+    try:
+        r = subprocess.run([str(exe), "--help"], capture_output=True, text=True, timeout=60)
+        return flag in (r.stdout or "") + (r.stderr or "")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def engine_has_dsv4(exe: Path) -> bool:
+    return engine_has_arg(exe, "--dsv4")
 
 
 def is_wsl() -> bool:
@@ -3196,6 +3278,15 @@ def main() -> int:
         family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)], "1", a.yes)) - 1]
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
+    if family == "dsv4":
+        # the DeepSeek-V4 serve path (src/program/dsv4_serve.cpp): one NVIDIA card, its own weights loading;
+        # the HIP kernels and the multi-GPU split are not written for it yet (docs/DSV4.md)
+        if hip:
+            fail("DeepSeek-V4-Flash runs on NVIDIA cards only for now (docs/DSV4.md)",
+                 "run it on an NVIDIA card, or choose another model")
+        if multi:
+            warn("--gpus: the DeepSeek-V4 serve path runs on one card (docs/DSV4.md): using the first only")
+            multi, sel = [], [a.gpu]
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
     say()
@@ -3214,12 +3305,16 @@ def main() -> int:
             say(f"  {i}) {m} {d['about']}; download {d['download_gb']:.0f} GB, keeps ~"
                 f"{resident_budget_gib(m, ram)} GB of its {d['arena_gb']:.0f} GB of experts in RAM{fit}")
             continue
-        if low_ram_needed(m, ram) and low_ram_fits(m, ram, gpu["vram_gb"]) and a.low_ram != "off":
+        if low_ram_needed(m, ram) and "dsv4" not in MODELS[m].get("families", ()) \
+                and low_ram_fits(m, ram, gpu["vram_gb"]) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, gpu['vram_gb']):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, gpu["vram_gb"]) else "the rest from the SSD)"))
         say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
+    if family == "dsv4":
+        warn(f"{model} is EXPERIMENTAL (docs/DSV4.md): the DeepSeek-V4 serve path has no drafter yet, so it "
+             "generates about 1 token/s, and the model's weights must fit the graphics card")
     budget, q4_split = None, False
     if MODELS[model].get("budget"):
         # Unsloth's UD-Q4_K_XL: a RAM budget of experts, the rest from the GGUF on the SSD - not the low-RAM mode (no
@@ -3253,8 +3348,11 @@ def main() -> int:
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
     elif a.resident_budget_gib is not None:
         warn(f"--resident-budget-gib is for UD-Q4_K_XL: {model} keeps all of its experts in RAM or in the low-RAM mode")
-    low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
-                                  (a.low_ram == "auto" and low_ram_needed(model, ram)))
+    if family == "dsv4" and a.low_ram not in ("auto", "off"):
+        # the DeepSeek-V4 serve path loads its weights onto the GPU itself: no RAM/mmap expert mode yet
+        warn("--low-ram: the DeepSeek-V4 serve path has no low-RAM mode yet (docs/DSV4.md): ignored")
+    low_ram = budget is None and family != "dsv4" and (a.low_ram in ("on", "resident", "mmap") or
+                                                       (a.low_ram == "auto" and low_ram_needed(model, ram)))
     if low_ram and multi and not low_ram_together(a, model, ram, gpu, chosen):
         multi, sel, chosen = [], [gpu["index"]], [gpu]
     # (the low-RAM mode's variant is decided once the context is known, below; on several GPUs it is the mapped one)
@@ -3388,7 +3486,8 @@ def main() -> int:
              if family == "swift" else f"the experimental speed projection is not tested with {model}: left off")
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
     shards = gguf_dir_shards(models_dir, fam, model) if a.gguf_dir else \
-        [models_dir / fam["file"].format(q=model, i=i) for i in range(1, fam.get("shards", 2) + 1)]
+        [models_dir / fam["file"].format(q=model, i=i, n=shard_count(fam, model))
+         for i in range(1, shard_count(fam, model) + 1)]
     problem = gguf_dir_problem(models_dir, shards[0], fam, model) if a.gguf_dir else None
     if problem:                                        # #444: files Strata cannot run, or another choice's files
         fail(*problem)
@@ -3450,8 +3549,12 @@ def main() -> int:
         lib_dirs = meta.get("lib_dirs") or meta.get("cuda_dirs") or cuda_lib_dirs()
     engine_ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
     if budget is not None and engine_ver < UNSLOTH_ENGINE:    # checked before the 111 GB download
-        fail(f"{model} needs engine {'.'.join(map(str, UNSLOTH_ENGINE))} or newer; this one is {meta.get('version')}",
+        fail(f"{model} needs engine {'. '.join(map(str, UNSLOTH_ENGINE)).replace('. ', '.')} or newer; this one is {meta.get('version')}",
              "update Strata (or compile the engine with --build) and run setup again")
+    if family == "dsv4" and not engine_has_dsv4(eng / EXE):    # checked before the 91 GB download
+        fail(f"this engine (version {meta.get('version')}) has no --dsv4 serve path: the published ready-made "
+             "engine does not include DeepSeek-V4 yet",
+             "compile the engine with --build (this checkout has it), or update Strata once a release includes it")
     ok(f"engine: {eng / EXE}")
 
     # ---- 5. the model files
@@ -3484,8 +3587,8 @@ def main() -> int:
         if s.name in fam.get("sha256", {}):
             verify_sha256(s, *fam["sha256"][s.name])
     ok("model files present")
-    mmproj = Path(a.models_dir) / fam["mmproj"]
-    if not mmproj.exists():
+    mmproj = Path(a.models_dir) / fam["mmproj"] if fam.get("mmproj") else None
+    if mmproj is not None and not mmproj.exists():
         mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
     if vision != "none":
         if not mmproj.exists() and a.gguf_dir and (Path(a.gguf_dir) / fam["mmproj"]).exists():
@@ -3518,43 +3621,62 @@ def main() -> int:
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
              "--experts-bin"], env=env)
     ok(f"model prepared: {pack}")
-    mtp = (find_in(roots, "mtp/rt/experts.bin") or data / "mtp/rt/experts.bin").parent.parent
-    rt = mtp / "rt"
-    corrupt = (rt / "experts.bin").exists() and mtp_corrupt(mtp, env)
-    if corrupt:
-        warn("some MTP tensors are not the checkpoint's (a download mirror that ignored range requests, #327): "
-             "fetching them again and rebuilding the draft layer")
-    if corrupt or not (rt / "experts.bin").exists():
-        say("  The MTP draft layer (speculative decoding, ~2x faster output) comes from the original Qwen checkpoint:")
-        say("  only its ~5 GB of MTP tensors are downloaded.")
-        run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)], env=env)
-        run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
-             "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
-        run([sys.executable, str(ROOT / "tools" / "mtp_rt.py"), "--gguf", str(mtp / "mtp-q2_0.gguf"), "--out", str(rt)],
-            env=env)
-    # a setup run again without --draft-vocab keeps the subset this model's config chose before (cyrillic, en)
-    draft_vocab = a.draft_vocab or saved_draft_vocab(ROOT / f"strata-{tag.lower()}.json")
-    refresh_draft_vocab(rt, draft_vocab or "cjk")
-    ok(f"MTP draft layer: {rt}")
-    for line in draft_vocab_note(gpu.get("vram_gb", 0.0), draft_vocab):   # #474: a recommendation, nothing changes
-        say("  " + line)
+    if family == "dsv4":
+        # no MTP draft layer: the artifact's drafter is a separate file and the serve path has no speculative
+        # decoding yet (docs/DSV4.md P4)
+        rt, draft_vocab = None, None
+    else:
+        mtp = (find_in(roots, "mtp/rt/experts.bin") or data / "mtp/rt/experts.bin").parent.parent
+        rt = mtp / "rt"
+        corrupt = (rt / "experts.bin").exists() and mtp_corrupt(mtp, env)
+        if corrupt:
+            warn("some MTP tensors are not the checkpoint's (a download mirror that ignored range requests, #327): "
+                 "fetching them again and rebuilding the draft layer")
+        if corrupt or not (rt / "experts.bin").exists():
+            say("  The MTP draft layer (speculative decoding, ~2x faster output) comes from the original Qwen checkpoint:")
+            say("  only its ~5 GB of MTP tensors are downloaded.")
+            run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)], env=env)
+            run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
+                 "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
+            run([sys.executable, str(ROOT / "tools" / "mtp_rt.py"), "--gguf", str(mtp / "mtp-q2_0.gguf"), "--out", str(rt)],
+                env=env)
+        # a setup run again without --draft-vocab keeps the subset this model's config chose before (cyrillic, en)
+        draft_vocab = a.draft_vocab or saved_draft_vocab(ROOT / f"strata-{tag.lower()}.json")
+        refresh_draft_vocab(rt, draft_vocab or "cjk")
+        ok(f"MTP draft layer: {rt}")
+        for line in draft_vocab_note(gpu.get("vram_gb", 0.0), draft_vocab):   # #474: a recommendation, nothing changes
+            say("  " + line)
 
     # ---- 7. the start script
     step(7, "writing the start script")
-    sys.path.insert(0, str(ROOT / "tools"))
-    from gguf_reader import GGUFFile                   # the PLE table's shard: shard 2 (original) or 1 (Swift)
-    ple = next((s for s in shards if any(t.name == "per_layer_token_embd.weight" for t in GGUFFile(s).tensors)), None)
-    if ple is None:
-        fail("the model has no per_layer_token_embd tensor (is this a Qwen3.8-Flash-Next GGUF?)")
-    # (a 4-shard file: the engine finds the PLE table's shard itself from shard 1, the measured setup)
-    args = ["--pack", str(pack), "--native", str(shards[0]), *(["--ple-gguf", str(ple)] if len(shards) <= 2 else []),
-            "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
-            "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
-            "--max-context", str(ctx)]
-    if scaling is not None:     # the resolved config: explicit flags as given, or the automatic yarn+factor
-        args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
-    if ctx > 8192:
-        args += ["--kv", kv]
+    if family == "dsv4":
+        # the DeepSeek-V4 serve path (src/program/dsv4_serve.cpp): the pack and the artifact's metadata shard
+        # (its geometry and tokenizer); no PLE table, no expert profile, no draft layer, no KV flags
+        args = ["--pack", str(pack), "--dsv4", str(shards[0]), "--max-context", str(ctx)]
+        if engine_has_arg(eng / EXE, "--dsv4-experts-ram"):
+            # the experts read from host RAM instead of experts.bin: 2.4x on the measured box (docs/DSV4.md).
+            # "auto" sizes the mirror to the RAM that is free when the model starts, and an engine that cannot
+            # get one keeps the file path, so asking for it is safe on any PC.  An engine from before the
+            # option (the published ready-made one) does not get the flag at all.
+            args += ["--dsv4-experts-ram", "auto"]
+    else:
+        sys.path.insert(0, str(ROOT / "tools"))
+        from gguf_reader import GGUFFile                   # the PLE table's shard: shard 2 (original) or 1 (Swift)
+        ple = next((s for s in shards
+                    if any(t.name == "per_layer_token_embd.weight" for t in GGUFFile(s).tensors)), None)
+        if ple is None:
+            fail("the model has no per_layer_token_embd tensor (is this a Qwen3.8-Flash-Next GGUF?)")
+        # (a 4-shard file: the engine finds the PLE table's shard itself from shard 1, the measured setup)
+        args = ["--pack", str(pack), "--native", str(shards[0]),
+                *(["--ple-gguf", str(ple)] if len(shards) <= 2 else []),
+                "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")),
+                "--expert-cache", "auto",
+                "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
+                "--max-context", str(ctx)]
+        if scaling is not None:     # the resolved config: explicit flags as given, or the automatic yarn+factor
+            args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
+        if ctx > 8192:
+            args += ["--kv", kv]
     if resident and a.low_ram != "resident" and engine_ver < RESIDENT_ENGINE:
         resident = False                               # an engine from before --resident-experts would refuse it
         ok(f"low-RAM mode: engine {meta.get('version')} has no resident variant yet; the experts are read through "
@@ -3570,7 +3692,9 @@ def main() -> int:
     # combination the engine refuses (PR review).
     # --kv-streaming on|off overrides the RAM test (the owner's rule); k8v4 and WSL stay off - they cannot stream.
     stream_fits = ram >= MODELS[model]["ram_gb"] + kv_ram_gb + 1
-    if kv == "k8v4":
+    if family == "dsv4":
+        pass                                       # the DeepSeek-V4 serve path keeps its state on the GPU: no KV streaming
+    elif kv == "k8v4":
         if ctx >= 65536:
             ok("KV streaming off: not supported with --kv k8v4; the KV cache stays in VRAM")
         if a.kv_streaming == "on":
@@ -3658,7 +3782,9 @@ def main() -> int:
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     cfg_path = ROOT / f"strata-{tag.lower()}.json"
-    cal = None if hip else saved_calibration(cfg)     # tools/calibrate.py is NVIDIA-only for now
+    # tools/calibrate.py is NVIDIA-only for now, and its settings are the Qwen path's (expert cache, spec depth):
+    # the DeepSeek-V4 serve path has none of those yet (docs/DSV4.md)
+    cal = None if hip or family == "dsv4" else saved_calibration(cfg)
     if cal is not None:
         sys.path.insert(0, str(ROOT / "tools"))
         import calibrate as CAL

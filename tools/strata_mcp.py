@@ -62,6 +62,12 @@ FALLBACK_MODELS = {
     "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but most experts come from the "
                             "SSD on a 64 GB PC (7-8.5 tokens/s measured)", "download_gb": 111.3, "ram_gb": 48,
                    "arena_gb": 77.0, "families": ("unsloth",), "budget": True},
+    "UD-IQ2_XXS": {"about": "2-bit (Unsloth Dynamic), EXPERIMENTAL: needs a 110+ GB PC; ~1 s/token until the "
+                             "drafter lands", "download_gb": 90.9, "ram_gb": 110, "arena_gb": 83.9,
+                   "families": ("dsv4",), "shards": 3},
+    "UD-IQ3_XXS": {"about": "3-bit (Unsloth Dynamic), EXPERIMENTAL: needs a 128+ GB PC; ~1 s/token until the "
+                             "drafter lands", "download_gb": 104.2, "ram_gb": 128, "arena_gb": 96.0,
+                   "families": ("dsv4",), "shards": 4},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -72,6 +78,9 @@ FALLBACK_FAMILIES = {
     "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "4-bit, 111 GB download, most experts read from the "
                                                                   "SSD: slow (7-8.5 tokens/s on a 64 GB PC)",
                 "tag": "unsloth-", "experimental": True, "vision": False},
+    "dsv4": {"title": "DeepSeek-V4-Flash", "about": "the 43-layer DeepSeek-V4 MoE: ~1 s/token (no drafter yet); "
+                                                    "needs a 110+ GB PC", "tag": "dsv4-",
+             "experimental": True, "vision": False},
 }
 FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "

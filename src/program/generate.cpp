@@ -100,6 +100,12 @@
 #include <set>
 #include <vector>
 
+namespace strata::program {
+int dsv4_serve_main(const std::string& pack, const std::string& shard1, int64_t max_context, bool serve,
+                    const std::string& dspark_gguf = "", const std::string& dspark_pack = "",
+                    int64_t spec_depth = 3, double spec_conf = 0.0, const std::string& experts_ram = "");
+}
+
 namespace {
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
@@ -161,6 +167,13 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::Exp
 
 struct Options {
     std::string pack = "pack/full";
+    std::string dsv4_gguf;            // --dsv4: the DeepSeek-V4 serve path (src/program/dsv4_serve.cpp);
+    std::string dspark_gguf;          // --dspark: the DSpark drafter sidecar GGUF for that path (docs/DSV4.md P4)
+    std::string dspark_pack;          // --dspark-pack: the drafter's packed weights (tools/iq_pack.py)
+    int64_t spec_depth = 3;           // --spec-depth: draft depth for the dsv4 spec loop (clamped to block_size)
+    double spec_conf = 0.0;           // --spec-conf: confidence-head early-stop threshold (0 = off)
+    std::string dsv4_experts_ram;     // --dsv4-experts-ram: GiB of the dsv4 experts kept in host RAM, or "auto"
+                                      // the value is the artifact's metadata shard (geometry + tokenizer ids)
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
     int64_t max_context = 4096;
@@ -437,7 +450,18 @@ void usage() {
     std::fprintf(stderr,
                  "strata generate --pack DIR --tokens \"1,2,3\" [options]\n"
                  "\n"
-                 "  --pack DIR           the pack directory (default pack/full)\n"
+                  "  --pack DIR           the pack directory (default pack/full)\n"
+                  "  --dsv4 SHARD1        DeepSeek-V4 serve path: the artifact's metadata shard (geometry + tokenizer\n"
+                  "                       ids); with --serve, speaks the same stdin/stdout protocol as the Qwen path\n"
+                  "  --dspark SIDECAR     with --dsv4: the DSpark drafter's GGUF (speculative decoding, docs/DSV4.md P4)\n"
+                  "  --dspark-pack DIR    with --dspark: the drafter's packed weights (tools/iq_pack.py of the sidecar)\n"
+                  "  --spec-depth N       with --dspark: draft depth per step (default 3, clamped to the sidecar's\n"
+                  "                       block_size)\n"
+                  "  --spec-conf F        with --dsv4: cut the draft at the first confidence below F (default 0 = off)\n"
+                  "  --dsv4-experts-ram N|auto\n"
+                  "                       with --dsv4: keep N GiB of the model's experts (auto: as much as the free RAM\n"
+                  "                       takes) in host memory, so a picked expert is copied to the GPU instead of read\n"
+                  "                       out of experts.bin for every token (docs/DSV4.md)\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --ple-gguf PATH      required PLE table (original second GGUF shard); with --native, the model's\n"
@@ -1088,6 +1112,12 @@ int main(int argc, char** argv) {
         bool parsed = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--pack") o.pack = next("--pack");
+        else if (a == "--dsv4") o.dsv4_gguf = next("--dsv4");
+        else if (a == "--dspark") o.dspark_gguf = next("--dspark");
+        else if (a == "--dspark-pack") o.dspark_pack = next("--dspark-pack");
+        else if (a == "--spec-depth") o.spec_depth = std::atoll(next("--spec-depth"));
+        else if (a == "--spec-conf") o.spec_conf = std::atof(next("--spec-conf"));
+        else if (a == "--dsv4-experts-ram") o.dsv4_experts_ram = next("--dsv4-experts-ram");
         else if (a == "--tokens") {
             if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
             std::string e;
@@ -1346,6 +1376,10 @@ int main(int argc, char** argv) {
         }
     }
     strata::core::set_coupled_draft(o.coupled_draft);
+    if (!o.dsv4_gguf.empty())   // the DeepSeek-V4 serve path: its own loop, its own forward (docs/DSV4.md P3)
+        return strata::program::dsv4_serve_main(o.pack, o.dsv4_gguf, o.max_context, o.serve,
+                                                o.dspark_gguf, o.dspark_pack, o.spec_depth, o.spec_conf,
+                                                o.dsv4_experts_ram);
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",

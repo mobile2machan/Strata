@@ -51,6 +51,9 @@ bool Dsv4State::init(const ModelGeometry& g, int64_t max_seq, std::string& err) 
     cudaMemset(arena_, 0, (size_t) total);
     arena_bytes_ = (size_t) total;
     layers_.assign((size_t) g.n_layers, Dsv4LayerState{});
+    carry_off_.assign((size_t) g.n_layers, 0);
+    carry_len_.assign((size_t) g.n_layers, 0);
+    carry_total_ = 0;
     char* at = (char*) arena_;
     for (int64_t l = 0; l < g.n_layers; ++l) {
         const int64_t ratio = g.dsv4.compress_ratios[(size_t) l];
@@ -66,6 +69,9 @@ bool Dsv4State::init(const ModelGeometry& g, int64_t max_seq, std::string& err) 
         st.ks = (float*) at;
         st.ss = st.ks + coff * ratio * item;
         at += align64(s.carry_floats * 4);
+        carry_off_[(size_t) l] = carry_total_;
+        carry_len_[(size_t) l] = align64(s.carry_floats * 4);
+        carry_total_ += align64(s.carry_floats * 4);
         if (ratio != 4) continue;
         st.idx = (uint16_t*) at;
         at += s.idx_bytes;
@@ -74,6 +80,8 @@ bool Dsv4State::init(const ModelGeometry& g, int64_t max_seq, std::string& err) 
         st.iks = (float*) at;
         st.iss = st.iks + coff * ratio * iitem;
         at += align64(coff * ratio * iitem * 2 * 4);
+        carry_len_[(size_t) l] += align64(coff * ratio * iitem * 2 * 4);
+        carry_total_ += align64(coff * ratio * iitem * 2 * 4);
     }
     return true;
 }
@@ -86,6 +94,25 @@ void Dsv4State::free() {
 
 void Dsv4State::reset() {
     if (arena_ != nullptr) cudaMemset(arena_, 0, arena_bytes_);
+}
+
+// The carries of one layer are one contiguous span of the arena: ks, ss, (r=4: padding, iks, iss).
+// Copying the span including its alignment padding is fine - it is our own device memory, and the
+// restore writes back exactly what the save read.
+void Dsv4State::carry_save(void* dst) const {
+    for (size_t l = 0; l < layers_.size(); ++l) {
+        if (carry_len_[l] == 0) continue;
+        cudaMemcpy((char*) dst + carry_off_[l], layers_[l].ks, (size_t) carry_len_[l],
+                   cudaMemcpyDeviceToDevice);
+    }
+}
+
+void Dsv4State::carry_restore(const void* src) const {
+    for (size_t l = 0; l < layers_.size(); ++l) {
+        if (carry_len_[l] == 0) continue;
+        cudaMemcpy(layers_[l].ks, (const char*) src + carry_off_[l], (size_t) carry_len_[l],
+                   cudaMemcpyDeviceToDevice);
+    }
 }
 
 }  // namespace strata::core

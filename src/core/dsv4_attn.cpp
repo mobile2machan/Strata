@@ -211,13 +211,20 @@ int64_t dsv4_attn_prefill_scratch_bytes(const ModelGeometry& g, int64_t layer, i
 
 bool dsv4_attn_prefill_step(const ModelGeometry& g, int64_t layer, const Dsv4AttnWeights& w,
                             Dsv4LayerState& st, const float* stream_in, float* stream_out,
-                            int64_t pos0, int64_t n, int64_t n_stage, float* scratch, void* cu) {
+                            int64_t pos0, int64_t n, int64_t n_stage, float* scratch, void* cu,
+                            float* carry_snap, int64_t carry_stride) {
     if (n < 1 || n > 8) return false;
     const int64_t hc = g.hc, dim = g.n_embd, hd = g.head_dim, rd = g.dsv4.rope_dim;
     const int64_t ratio = g.dsv4.compress_ratios[(size_t) layer];
     const bool compressed = ratio > 0, indexed = ratio == 4;
     const int64_t mix_hc = (2 + hc) * g.hc;
     const float eps = g.dsv4.norm_eps;
+    // The per-position carry snapshot's row layout matches `Dsv4State`'s arena span exactly -
+    // [align64(ks+ss bytes)][align64(iks+iss bytes)] - so a snapshot row is a `carry_restore` source.
+    const Dsv4PoolSizes psz = dsv4_pool_sizes(g, layer, 1);
+    const int64_t snap_main = (psz.carry_floats * 4 + 63) / 64 * 64 / 4;
+    const int64_t snap_row = carry_stride > 0 ? carry_stride
+                                              : snap_main + (psz.idx_carry_floats * 4 + 63) / 64 * 64 / 4;
     Cursor cur{(char*) scratch, 0, false};
     PScratch s = pcarve(cur, g, n, n_stage);
 
@@ -265,6 +272,9 @@ bool dsv4_attn_prefill_step(const ModelGeometry& g, int64_t layer, const Dsv4Att
             kernels::compressor_decode_step(pos, ratio, indexed, hd, s.ckv + t * item,
                                             s.csc + t * item, w.ape, st.ks, st.ss,
                                             s.cmp_f + t * hd, cu);
+            if (carry_snap != nullptr)
+                cudaMemcpyAsync(carry_snap + t * snap_row, st.ks, (size_t) psz.carry_floats * 4,
+                                cudaMemcpyDeviceToDevice, (cudaStream_t) cu);
             if ((pos + 1) % ratio == 0) {
                 kernels::rms_norm_weighted(s.cmp_f + t * hd, w.comp_norm, 1, hd, eps, cu);
                 const int64_t bpos = pos + 1 - ratio > 0 ? pos + 1 - ratio : 0;
@@ -312,6 +322,10 @@ bool dsv4_attn_prefill_step(const ModelGeometry& g, int64_t layer, const Dsv4Att
             kernels::compressor_decode_step(pos, 4, true, g.idx_key_dim, s.ikv + t * iitem,
                                             s.isc + t * iitem, w.idx_ape, st.iks, st.iss,
                                             s.icmp_f + t * g.idx_key_dim, cu);
+            if (carry_snap != nullptr)
+                cudaMemcpyAsync(carry_snap + t * snap_row + snap_main, st.iks,
+                                (size_t) psz.idx_carry_floats * 4, cudaMemcpyDeviceToDevice,
+                                (cudaStream_t) cu);
             if ((pos + 1) % 4 == 0) {
                 kernels::rms_norm_weighted(s.icmp_f + t * g.idx_key_dim, w.idx_comp_norm, 1,
                                            g.idx_key_dim, eps, cu);

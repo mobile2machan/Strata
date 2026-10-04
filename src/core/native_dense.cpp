@@ -15,6 +15,9 @@ namespace strata::core {
 namespace {
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     const auto& name = tensor.name;
+    // The DSpark drafter's fusion (docs/DSV4.md P4) is not a per-layer tensor - it sits at the top
+    // level, so the `blk.` gate below would never see it.  Only a dflash pack carries it.
+    if (name == "fc.weight") return true;
     if (name.rfind("blk.", 0) != 0) return false;
     // Match the native PLE kernel: Q2_0, IQ3_XXS, IQ4_XS and Q8_0 (UD-Q4_K_XL). Other keys retain the packed BF16
     // fallback.

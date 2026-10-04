@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jinja2
+from jinja2.meta import find_undeclared_variables
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 
@@ -42,9 +43,16 @@ class ChatTemplate:
 
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
         env.filters["tojson"] = tojson
+        env.filters["from_json"] = json.loads   # DeepSeek-V4's template parses its own tool-call JSON with it
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        # Which thinking dialect the template speaks, read off the template itself rather than guessed from a
+        # model name: Qwen3.8-Flash-Next's takes `enable_thinking`/`reasoning_effort` (low/medium/xhigh),
+        # DeepSeek-V4's (docs/DSV4.md P3) takes `thinking` (bool, default off) + `reasoning_effort`
+        # ("high"/"max").  A template that reads `thinking` undeclared is the latter.
+        self.variables = find_undeclared_variables(env.parse(self.source))
+        self.dialect = "dsv4" if "thinking" in self.variables else "qwen"
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -69,26 +77,37 @@ IMAGE_PARTS = ("image_url", "input_image", "image")
 EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
+# The DeepSeek-V4 template (docs/DSV4.md P3) knows two effort strings, "high" and "max", and a `thinking`
+# bool that defaults to off - so asking for any level must turn thinking ON, and the six client levels
+# collapse onto its two.
+EFFORT_DSV4 = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
+               "low": "high", "medium": "high", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 
-def effort_kwargs(value) -> dict:
+
+def effort_kwargs(value, dialect: str = "qwen") -> dict:
     """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
+    table = EFFORT_DSV4 if dialect == "dsv4" else EFFORT
     if value is None or value == "":
         return {}
     if value is False:
-        return {"enable_thinking": False}
+        return {"thinking": False} if dialect == "dsv4" else {"enable_thinking": False}
     key = str(value).strip().lower()
-    if key not in EFFORT:
+    if key not in table:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
-    level = EFFORT[key]
+    level = table[key]
+    if dialect == "dsv4":
+        return {"thinking": False} if level is None else {"thinking": True, "reasoning_effort": level}
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
 
-def budget_effort(tokens) -> dict:
+def budget_effort(tokens, dialect: str = "qwen") -> dict:
     """Anthropic's thinking budget (budget_tokens) -> a level: under 2K low, under 8K medium, else high."""
     try:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
+    if dialect == "dsv4":
+        return {"thinking": True, "reasoning_effort": "high" if n < 8192 else "max"}
     return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "xhigh"}
 
 
@@ -160,8 +179,11 @@ def _object_list(value, name: str) -> list[dict]:
     return value
 
 
-def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+def openai_to_messages(req: dict, dialect: str = "qwen") -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
+    if isinstance(req.get("extra_body"), dict):
+        for k, v in req["extra_body"].items():
+            req.setdefault(k, v)
     messages = []
     for m in _object_list(req.get("messages"), "messages"):
         role = m.get("role")
@@ -187,17 +209,20 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     kwargs = {}
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
-    kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort")))
+    kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort"), dialect))
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
+    off_key = "thinking" if dialect == "dsv4" else "enable_thinking"
     for k, v in (req.get("chat_template_kwargs") or {}).items():
-        if k == "enable_thinking" and not v:
-            kwargs = {"enable_thinking": False}
-        elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
-            kwargs.update(effort_kwargs(v))
+        if dialect == "dsv4" and k == "thinking":
+            kwargs["thinking"] = bool(v)
+        elif k == "enable_thinking" and not v:
+            kwargs = {off_key: False}
+        elif k == "reasoning_effort" and off_key not in kwargs:
+            kwargs.update(effort_kwargs(v, dialect))
     return _late_system_to_user(messages), tools, kwargs
 
 
-def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
+def anthropic_to_messages(req: dict, think_unasked: bool = True, dialect: str = "qwen") -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
     without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
     renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
@@ -235,16 +260,17 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
              for t in req.get("tools") or []] or None
     kwargs = {}
+    off_key = "thinking" if dialect == "dsv4" else "enable_thinking"
     # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
     # "output_config": {"effort": "low" | "medium" | "high"}
     thinking = req.get("thinking")
     effort = (req.get("output_config") or {}).get("effort") if isinstance(req.get("output_config"), dict) else None
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
-        kwargs["enable_thinking"] = False
+        kwargs[off_key] = False
     elif effort:
-        kwargs.update(effort_kwargs(effort))
+        kwargs.update(effort_kwargs(effort, dialect))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
-        kwargs.update(budget_effort(thinking["budget_tokens"]))
+        kwargs.update(budget_effort(thinking["budget_tokens"], dialect))
     elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
         # Opt-in (the config's "anthropic_thinking": "on_request"; the default thinks as 0.1.31 did, since a
         # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
@@ -252,7 +278,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # and allow a few dozen tokens, which the model otherwise spent thinking and answered with no text at all.
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
-        kwargs["enable_thinking"] = False
+        kwargs[off_key] = False
     return _late_system_to_user(messages), tools, kwargs
 
 

@@ -25,7 +25,10 @@ namespace strata::core {
 
 /// Which model family a pack is.  The engine had exactly one (`qwen4exp`) until `deepseek4` (docs/DSV4.md);
 /// the reader that fills the geometry dispatches on `general.architecture`, and so does `check_layer`.
-enum class ModelArch : int { Qwen4Exp = 0, DeepSeek4 = 1 };
+/// `dflash` is the DSpark drafter beside the DeepSeek-V4 target (docs/DSV4.md P4): its blocks ARE deepseek4
+/// blocks - every one of them the r=0 window-only class - so `check_one_dsv4` serves them; what is unique
+/// to it is the top-level fusion/head tensors, checked in `check_all`'s dflash branch.
+enum class ModelArch : int { Qwen4Exp = 0, DeepSeek4 = 1, DFlash = 2 };
 
 /// The model's geometry, taken from `docs/semantics.md` and the artifact's own metadata.  Every field here
 /// is a number a kernel depends on, so a change is a change to a kernel contract and not a tuning knob.
@@ -97,6 +100,24 @@ struct ModelGeometry {
         /// and the array itself is 46 entries long - the last three belong to no layer and are ignored.
         std::vector<int64_t> compress_ratios;
     } dsv4;
+
+    /// dflash only (docs/DSV4.md P4).  The drafter's block parameters live in `dsv4` above - its layers are
+    /// deepseek4 r=0 layers, and the reader fills `dsv4.compress_ratios` with zeros to say so.  What is
+    /// dflash's own is how it attaches to the target: `fc` consumes the target hidden states of
+    /// `target_layers` (measured [41, 42, 43] - 43 is the post-layer-42 hidden, i.e. the last one before
+    /// the head), and `block_size` is the trained draft block (`dspark_block_size` in DeepSeek's config;
+    /// measured 5).  The Markov head's rank and the vocab it spans are NOT in the metadata - they are only
+    /// readable from the tensor shapes, and `check_all` pins them against the rest of the head.
+    struct Dflash {
+        int64_t block_size = 0;
+        std::vector<int64_t> target_layers;
+        /// The block the drafter feeds is `[anchor, mask * (d-1)]`; `mask_token_id` is the mask the
+        /// sidecar's tokenizer names (measured 128799).  `sample_from_anchor` is the SpecForge export
+        /// flag (measured absent, llama.cpp's default true): with it, every block position - the anchor
+        /// slot first - is a prediction slot.
+        int64_t mask_token_id = -1;
+        bool sample_from_anchor = true;
+    } dflash;
 
     int64_t hc_dim() const { return hc * n_embd; }
     /// `layer % qsa_interval == qsa_interval - 1` is full attention.  Derived, not a second list.

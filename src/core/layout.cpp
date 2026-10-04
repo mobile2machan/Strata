@@ -147,8 +147,96 @@ bool check_one_dsv4(const WeightTable& t, const ModelGeometry& g, int64_t layer,
     return true;
 }
 
+// ---- dflash (the DSpark drafter, docs/DSV4.md P4).  Its LAYERS are deepseek4 r=0 layers and
+// `check_one_dsv4` serves them; what is unique to the drafter is the set of top-level tensors that attach
+// it to the target.  Every shape below was read off the sidecar's own tensor directory
+// (dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf, 81 tensors, 2026-08):
+//
+//   fc.weight            Q8_0 [12288, 4096]  = [n_embd * |target_layers|, n_embd]: the fusion of the
+//                                            target hidden states the drafter reads.  Served natively.
+//   enc.output_norm      F32  [4096]         the norm on the fused input before the blocks.
+//   markov_w1/w2         BF16 [256, 129280]  the Markov head: a rank-256 first-order correction over the
+//                                            129280-token vocabulary.  Neither number is in the metadata -
+//                                            the shapes are the only place they exist.
+//   conf_proj.weight     BF16 [4352, 1]      the confidence head: [n_embd + 256, 1] - the block output
+//                                            CONCATENATED with the Markov feature, so its width is pinned
+//                                            to the Markov rank rather than trusted.
+//   output_hc_base/fn/scale F32 [4] [16384,4] [1]  the head's mHC collapse: hc streams -> 1.  Note the
+//                                            fn width is hc (one weight per stream), NOT the 6*hc of the
+//                                            per-layer mixing - a different form, and the scale is 1, not
+//                                            hc-1.
+//   output_norm.weight   F32  [4096]         the last norm before the borrowed target head.
+//
+// The vocab dimension (markov ne1) is checked against the TARGET's vocab by the drafter loader, which knows
+// it; here the head is pinned only against itself.
+bool check_dflash_extras(const WeightTable& t, const ModelGeometry& g, std::string& err) {
+    auto fail2 = [&](const char* name, const char* what, int64_t got, int64_t want) {
+        char buf[512];
+        std::snprintf(buf, sizeof buf, "%s %s is %lld, the drafter's kernels require %lld", name, what,
+                      (long long) got, (long long) want);
+        err = buf;
+        return false;
+    };
+    auto fail_form = [&](const char* name, int got, int want) {
+        char buf[512];
+        std::snprintf(buf, sizeof buf, "%s is engine form %d, the drafter's kernels read it as form %d", name,
+                      got, want);
+        err = buf;
+        return false;
+    };
+    auto want2 = [&](const char* name, int64_t ne0, int64_t ne1, bool check_form, WeightKind kind) -> bool {
+        const WeightRef* r = t.find(name);
+        if (!r) { err = std::string("missing ") + name; return false; }
+        if (r->ne0 != ne0) return fail2(name, "ne0", r->ne0, ne0);
+        if (r->ne1 != ne1) return fail2(name, "ne1", r->ne1, ne1);
+        if (check_form && r->kind != kind) return fail_form(name, (int) r->kind, (int) kind);
+        return true;
+    };
+    auto want1 = [&](const char* name, int64_t elements, WeightKind kind) -> bool {
+        const WeightRef* r = t.find(name);
+        if (!r) { err = std::string("missing ") + name; return false; }
+        if (r->elements != elements) return fail2(name, "elements", r->elements, elements);
+        if (r->kind != kind) return fail_form(name, (int) r->kind, (int) kind);
+        return true;
+    };
+
+    const int64_t n_t = (int64_t) g.dflash.target_layers.size();
+    if (n_t == 0) { err = "the geometry names no target layers, so fc has no width"; return false; }
+    if (!want2("fc.weight", g.n_embd * n_t, g.n_embd, false, WeightKind::Verbatim)) return false;
+    if (!want1("enc.output_norm.weight", g.n_embd, WeightKind::F32)) return false;
+
+    // The Markov head first: its rank and vocab come from its own shape, and the second half must agree
+    // with the first (two tensors, one head).
+    auto present_form = [&](const char* name, WeightKind kind) -> bool {
+        const WeightRef* r = t.find(name);
+        if (!r) { err = std::string("missing ") + name; return false; }
+        if (r->kind != kind) return fail_form(name, (int) r->kind, (int) kind);
+        return true;
+    };
+    if (!present_form("markov_w1.weight", WeightKind::Bf16InF32)) return false;
+    if (!present_form("markov_w2.weight", WeightKind::Bf16InF32)) return false;
+    const WeightRef* w1 = t.find("markov_w1.weight");
+    const WeightRef* w2 = t.find("markov_w2.weight");
+    if (w1->ne0 != w2->ne0) return fail2("markov_w2.weight", "ne0", w2->ne0, w1->ne0);
+    if (w1->ne1 != w2->ne1) return fail2("markov_w2.weight", "ne1", w2->ne1, w1->ne1);
+    if (w1->ne0 <= 0 || w1->ne1 <= 0) { err = "the Markov head has a zero dimension"; return false; }
+
+    // The confidence head consumes the block output AND the Markov feature - its width is the sum, and a
+    // pack that disagrees is a different head than the kernels read.
+    if (!want2("conf_proj.weight", g.n_embd + w1->ne0, 1, true, WeightKind::Bf16InF32)) return false;
+
+    // The head's mHC collapse: one weight per stream (hc), not the 6*hc of the per-layer mixing.
+    if (!want1("output_hc_base.weight", g.hc, WeightKind::F32)) return false;
+    if (!want2("output_hc_fn.weight", g.hc_dim(), g.hc, true, WeightKind::F32)) return false;
+    if (!want1("output_hc_scale.weight", 1, WeightKind::F32)) return false;
+    if (!want1("output_norm.weight", g.n_embd, WeightKind::F32)) return false;
+    return true;
+}
+
 bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std::string& err) {
-    if (g.arch == ModelArch::DeepSeek4) return check_one_dsv4(t, g, layer, err);
+    // dflash layers ARE deepseek4 layers - the dflash reader fills `dsv4` with all-zero ratios and
+    // hash_layers 0, which is exactly the class set the sidecar's tensors back.
+    if (g.arch == ModelArch::DeepSeek4 || g.arch == ModelArch::DFlash) return check_one_dsv4(t, g, layer, err);
     const LayerView v(t, layer);
     const bool qsa = is_qsa_layer(g, layer);
 
@@ -253,6 +341,26 @@ bool check_layer(const WeightTable& table, const ModelGeometry& g, int64_t layer
 }
 
 bool check_all(const WeightTable& table, const ModelGeometry& g, std::string& err) {
+    if (g.arch == ModelArch::DFlash) {
+        // The drafter: every layer the r=0 window class (the reader guarantees it; this is the gate that
+        // says so before any per-layer check runs), then the top-level tensors that attach it to the
+        // target.  The target_layers VALUES against the target's layer count is the drafter loader's
+        // check - this table holds only the drafter.
+        if ((int64_t) g.dsv4.compress_ratios.size() < g.n_layers) {
+            err = "compress_ratios covers " + std::to_string(g.dsv4.compress_ratios.size()) +
+                  " layers, the drafter has " + std::to_string(g.n_layers);
+            return false;
+        }
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (dsv4_ratio(g, l) != 0) {
+                err = "layer " + std::to_string(l) + ": compress_ratio " +
+                      std::to_string(dsv4_ratio(g, l)) + ", the drafter implements only the r=0 class";
+                return false;
+            }
+            if (!check_one(table, g, l, err)) return false;
+        }
+        return check_dflash_extras(table, g, err);
+    }
     if (g.arch == ModelArch::DeepSeek4) {
         // The layer classes come from the artifact's own array; the cross-layer check is that the array
         // COVERS every layer and only names classes the pack can serve.  The per-layer presence checks in

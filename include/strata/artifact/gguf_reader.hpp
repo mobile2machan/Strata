@@ -607,6 +607,13 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
         if (!g.get("deepseek4.block_count")) return "missing deepseek4.block_count";
         return {};
     }
+    if (arch->s == "dflash") {
+        // The DSpark drafter (docs/DSV4.md P4): its layers are deepseek4 r=0 layers, so the same
+        // presence-only rule applies - `dflash_geometry` is what actually validates the file, and the
+        // drafter's loader runs it before any weight is read.
+        if (!g.get("dflash.block_count")) return "missing dflash.block_count";
+        return {};
+    }
     if (arch->s != "qwen4exp") return "architecture is '" + arch->s + "', this engine requires 'qwen4exp'";
     struct Req {
         const char* key;

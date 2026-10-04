@@ -17,7 +17,8 @@ offers the same steps as tools.
 - How the engine works, every measured number, the API and all settings: [docs/DETAILS.md](docs/DETAILS.md) and
   the [paper](docs/paper/Strata-Paper.pdf).
 - AMD (HIP) build and validation: [docs/AMD_HIP.md](docs/AMD_HIP.md); multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
-- DeepSeek-V4-Flash support plan (pack built and verified; the engine reads all its weights - dense, experts incl. MXFP4 - but computes no token yet): [docs/DSV4.md](docs/DSV4.md).
+- DeepSeek-V4-Flash support plan (P0-P3 done: pack, engine forward, the `--dsv4` serve path and the `setup.py`
+  family; the drafter is P4): [docs/DSV4.md](docs/DSV4.md).
 - Setup's own tests run without a GPU or downloads: `python tools/test_setup_<name>.py` (for example
   `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).
 - Keep the docs' style: plain words, measured numbers with what they were measured on, no claims without a

@@ -358,7 +358,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
       src/core/dsv4_state.cpp src/core/dsv4_attn.cpp src/core/dsv4_ffn.cpp src/core/dsv4_block.cpp
-      src/core/dsv4_weights.cpp src/core/dsv4_forward.cpp)
+      src/core/dsv4_weights.cpp src/core/dsv4_forward.cpp src/core/dspark_forward.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
@@ -394,6 +394,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(dsv4_layout_test PRIVATE strata_engine)
     add_test(NAME dsv4_layout_test COMMAND dsv4_layout_test)
     set_tests_properties(dsv4_layout_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    # docs/DSV4.md P4 first step: the dflash (DSpark drafter) geometry reader and its shape checks, over a
+    # synthetic GGUF and a synthetic pack (needs a device, 77 without)
+    add_executable(dflash_layout_test tests/core/dflash_layout_test.cpp)
+    target_link_libraries(dflash_layout_test PRIVATE strata_engine)
+    add_test(NAME dflash_layout_test COMMAND dflash_layout_test)
+    set_tests_properties(dflash_layout_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 
     add_executable(dsv4_state_test tests/core/dsv4_state_test.cpp)
     target_link_libraries(dsv4_state_test PRIVATE strata_engine)
@@ -436,6 +442,31 @@ set_tests_properties(dsv4_block_layer_parity PROPERTIES TIMEOUT 600)
     else()
       message(STATUS "strata: STRATA_DSV4_PACK / STRATA_DSV4_SHARD1 not set - the real deepseek4 layout test is NOT registered")
     endif()
+    # the same for the DSpark drafter (docs/DSV4.md P4): the geometry out of the sidecar's own metadata,
+    # the shape tables over the pack built from it
+    set(STRATA_DFLASH_PACK "" CACHE PATH "a built dflash pack (tools/iq_pack.py on the DSpark sidecar) for the real drafter layout test")
+    set(STRATA_DFLASH_GGUF "" CACHE PATH "the DSpark sidecar GGUF that pack was built from")
+    if(STRATA_DFLASH_PACK AND STRATA_DFLASH_GGUF AND EXISTS "${STRATA_DFLASH_PACK}/index.txt" AND EXISTS "${STRATA_DFLASH_GGUF}")
+      add_test(NAME dflash_layout_real
+               COMMAND dflash_layout_test --real ${STRATA_DFLASH_PACK} ${STRATA_DFLASH_GGUF})
+      set_tests_properties(dflash_layout_real PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    else()
+      message(STATUS "strata: STRATA_DFLASH_PACK / STRATA_DFLASH_GGUF not set - the real dflash layout test is NOT registered")
+    endif()
+    # the drafter's own math against a float64 reference over the real sidecar weights (docs/DSV4.md P4):
+    # it needs the sidecar pack, the sidecar GGUF the pack came from, and the target's shards for the
+    # borrowed embeddings and head.
+    if(STRATA_DFLASH_PACK AND STRATA_DFLASH_GGUF AND STRATA_DSV4_SHARD1 AND
+       EXISTS "${STRATA_DFLASH_PACK}/index.txt" AND EXISTS "${STRATA_DFLASH_GGUF}" AND EXISTS "${STRATA_DSV4_SHARD1}")
+      add_executable(dspark_parity tests/core/dspark_parity.cpp)
+      target_link_libraries(dspark_parity PRIVATE strata_engine strata_artifact strata_kernels_cpu)
+      add_test(NAME dspark_parity
+               COMMAND dspark_parity --sidecar-pack ${STRATA_DFLASH_PACK} --sidecar-gguf ${STRATA_DFLASH_GGUF}
+                       --target-shard1 ${STRATA_DSV4_SHARD1})
+      set_tests_properties(dspark_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+    else()
+      message(STATUS "strata: STRATA_DFLASH_PACK / STRATA_DFLASH_GGUF / STRATA_DSV4_SHARD1 not set - dspark_parity is NOT registered")
+    endif()
     # #369: per-layer admission on a sized (native pack) cache starts each layer in its own range
     add_executable(expert_cache_per_layer_test tests/core/expert_cache_per_layer_test.cpp)
     target_link_libraries(expert_cache_per_layer_test PRIVATE strata_engine)
@@ -477,7 +508,7 @@ set_tests_properties(dsv4_block_layer_parity PROPERTIES TIMEOUT 600)
     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
   endif()
 
-  add_executable(strata src/program/generate.cpp)
+  add_executable(strata src/program/generate.cpp src/program/dsv4_serve.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 

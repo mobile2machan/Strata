@@ -40,10 +40,12 @@ int64_t dsv4_block_prefill_scratch_bytes(const ModelGeometry& g, int64_t layer, 
 
 /// `n` tokens (1..8) at positions `pos0..pos0+n-1` through the whole block in one pass.  Streams
 /// are token-major [n][hc * n_embd] f32 and must not alias each other; `token_ids` selects the
-/// hash row per token.  Same math as `n` decode steps at consecutive positions.
+/// hash row per token.  Same math as `n` decode steps at consecutive positions.  `carry_snap`
+/// (see `dsv4_attn_prefill_step`) is the verify window's per-position carry rollback data.
 bool dsv4_block_prefill(const ModelGeometry& g, int64_t layer, const Dsv4BlockWeights& w,
                         Dsv4LayerState& st, const float* stream_in, float* stream_out,
                         const int64_t* token_ids, int64_t pos0, int64_t n, int64_t n_stage,
-                        float* scratch, void* cu_stream, Dsv4ExpertSource* src = nullptr);
+                        float* scratch, void* cu_stream, Dsv4ExpertSource* src = nullptr,
+                        float* carry_snap = nullptr, int64_t carry_stride = 0);
 
 }  // namespace strata::core

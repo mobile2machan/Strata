@@ -47,7 +47,8 @@ int64_t dsv4_block_prefill_scratch_bytes(const ModelGeometry& g, int64_t layer, 
 bool dsv4_block_prefill(const ModelGeometry& g, int64_t layer, const Dsv4BlockWeights& w,
                         Dsv4LayerState& st, const float* stream_in, float* stream_out,
                         const int64_t* token_ids, int64_t pos0, int64_t n, int64_t n_stage,
-                        float* scratch, void* cu_stream, Dsv4ExpertSource* src) {
+                        float* scratch, void* cu_stream, Dsv4ExpertSource* src, float* carry_snap,
+                        int64_t carry_stride) {
     float* p = scratch;
     float* s_attn = p;
     p += align256(dsv4_attn_prefill_scratch_bytes(g, layer, n, n_stage)) / (int64_t) sizeof(float);
@@ -56,7 +57,7 @@ bool dsv4_block_prefill(const ModelGeometry& g, int64_t layer, const Dsv4BlockWe
     float* mid = p;  // [n][hc * n_embd]
 
     if (!dsv4_attn_prefill_step(g, layer, w.attn, st, stream_in, mid, pos0, n, n_stage, s_attn,
-                                cu_stream))
+                                cu_stream, carry_snap, carry_stride))
         return false;
     return dsv4_ffn_prefill_step(g, layer, w.ffn, mid, stream_out, token_ids, n, s_ffn, cu_stream,
                                  src);
