@@ -540,7 +540,7 @@ class RouterHandler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description="Strata Model Switcher Router")
     parser.add_argument("--host", default="127.0.0.1", help="ルーター待受ホスト (デフォルト: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8090, help="ルーター待受ポート (デフォルト: 8090)")
+    parser.add_argument("--port", type=int, default=8080, help="ルーター待受ポート (デフォルト: 8080)")
     parser.add_argument("--backend-host", default="127.0.0.1", help="Strata バックエンドホスト (デフォルト: 127.0.0.1)")
     parser.add_argument("--backend-port", type=int, default=8091, help="Strata バックエンドポート (デフォルト: 8091)")
     parser.add_argument("--api-key", default="", help="クライアント認証およびバックエンドに渡す API キー")
