@@ -61,13 +61,17 @@ DEFAULT_MODEL = "swift-1.5-iq2_xs-dual-gpu"
 
 def is_port_available(host: str, port: int) -> bool:
     """ポートが現在バインド可能（空き）か検査する"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.5)
-        try:
-            s.bind((host, port))
-            return True
-        except OSError:
-            return False
+    hosts_to_check = [host]
+    if host == "0.0.0.0":
+        hosts_to_check.append("127.0.0.1")
+    for h in hosts_to_check:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            try:
+                s.bind((h, port))
+            except OSError:
+                return False
+    return True
 
 
 class ModelManager:
@@ -263,11 +267,24 @@ class RouterHandler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def is_trusted_origin(self, origin: str) -> bool:
+        if not origin:
+            return True
+        try:
+            parsed = urlparse(origin)
+            host = parsed.hostname or ""
+            if host in ("localhost", "127.0.0.1"):
+                return True
+            if host.startswith("192.168.") or host.startswith("10.") or (host.startswith("172.") and 16 <= int(host.split(".")[1]) <= 31):
+                return True
+        except Exception:
+            pass
+        return False
+
     def send_cors_headers(self):
-        # ローカル接続専用の CORS ヘッダー
         origin = self.headers.get("Origin", "")
-        if origin.startswith("http://127.0.0.1") or origin.startswith("http://localhost"):
-            self.send_header("Access-Control-Allow-Origin", origin)
+        if self.is_trusted_origin(origin):
+            self.send_header("Access-Control-Allow-Origin", origin if origin else "*")
         else:
             self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
@@ -539,7 +556,7 @@ class RouterHandler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="Strata Model Switcher Router")
-    parser.add_argument("--host", default="127.0.0.1", help="ルーター待受ホスト (デフォルト: 127.0.0.1)")
+    parser.add_argument("--host", default="0.0.0.0", help="ルーター待受ホスト (デフォルト: 0.0.0.0 - LANアクセス許可)")
     parser.add_argument("--port", type=int, default=8080, help="ルーター待受ポート (デフォルト: 8080)")
     parser.add_argument("--backend-host", default="127.0.0.1", help="Strata バックエンドホスト (デフォルト: 127.0.0.1)")
     parser.add_argument("--backend-port", type=int, default=8091, help="Strata バックエンドポート (デフォルト: 8091)")
