@@ -222,7 +222,6 @@ class ModelManager:
             print(f"[ルーター] ポート {self.backend_host}:{self.backend_port} の解放を確認しました。", flush=True)
 
         self.current_model = None
-        self.status = "stopped"
 
     def _switch_worker(self, model_key: str):
         """別スレッドでモデル切り替えを実行するルーチン"""
@@ -236,8 +235,16 @@ class ModelManager:
                 self.last_error = str(e)
 
     def _do_switch(self, model_key: str):
+        with self.lock:
+            self.status = "switching"
+            self.target_model = model_key
+
         # 1. 既存バックエンドおよび競合エンジンの完全停止 (VRAM 解放)
         self.stop_backend()
+
+        with self.lock:
+            self.status = "switching"
+            self.target_model = model_key
 
         # 2. ポート空き確認
         if not is_port_available(self.backend_host, self.backend_port):
