@@ -74,6 +74,30 @@ def is_port_available(host: str, port: int) -> bool:
     return True
 
 
+def cleanup_strata_engine_processes(exclude_pids: set[int] | None = None):
+    """自前の子以外の strata.exe / strata-vision.exe を終了して VRAM を全解放する"""
+    if os.name != "nt":
+        return
+    exclude = exclude_pids or set()
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq strata*", "/FO", "CSV", "/NH"],
+            text=True, stderr=subprocess.DEVNULL
+        )
+        for line in out.splitlines():
+            parts = line.strip().split('","')
+            if len(parts) >= 2:
+                name = parts[0].strip('"')
+                pid_str = parts[1].strip('"')
+                if pid_str.isdigit() and ("strata.exe" in name.lower() or "strata-vision.exe" in name.lower()):
+                    pid = int(pid_str)
+                    if pid not in exclude:
+                        print(f"[ルーター] 競合するエンジンプロセス {name} (PID: {pid}) を検出。VRAM 解放のため終了します...", flush=True)
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False)
+    except Exception:
+        pass
+
+
 class ModelManager:
     def __init__(self, backend_host: str, backend_port: int, api_key: str = ""):
         self.backend_host = backend_host
@@ -101,7 +125,7 @@ class ModelManager:
         return None
 
     def stop_backend(self):
-        """バックエンドプロセスを停止し、ポートが確実に解放されるまで待機する"""
+        """バックエンドプロセスを停止し、残存エンジンを強制一掃してポートおよび VRAM を完全解放する"""
         if self.backend_proc:
             pid = self.backend_proc.pid
             print(f"[ルーター] バックエンドプロセス (PID: {pid}) を停止中...", flush=True)
@@ -114,6 +138,9 @@ class ModelManager:
             except Exception as e:
                 print(f"[ルーター] プロセス停止中にエラー: {e}", flush=True)
             self.backend_proc = None
+
+        # 孤立した strata.exe / strata-vision.exe を完全に一掃し、VRAM を 100% 解放
+        cleanup_strata_engine_processes()
 
         # ポート解放の待機検査
         deadline = time.time() + 10.0
@@ -142,7 +169,7 @@ class ModelManager:
                 self.last_error = str(e)
 
     def _do_switch(self, model_key: str):
-        # 1. 既存バックエンドを停止
+        # 1. 既存バックエンドおよび競合エンジンの完全停止 (VRAM 解放)
         self.stop_backend()
 
         # 2. ポート空き確認
@@ -190,11 +217,23 @@ class ModelManager:
 
         print(f"[ルーター] プロセス起動開始 (PID: {self.backend_proc.pid})。モデルロード待機中...", flush=True)
 
-        # 起動待機: タイムアウトを 600秒 (10分) に設定。子が生きて進捗を出している間は殺さない
-        timeout = 600.0
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            # 子プロセスが死んでいないか検査
+        # ログファイルのパス取得
+        log_path = None
+        try:
+            cfg_data = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+            if "log" in cfg_data:
+                log_path = Path(cfg_data["log"])
+        except Exception:
+            pass
+
+        last_progress_time = time.time()
+        last_log_size = log_path.stat().st_size if log_path and log_path.exists() else 0
+
+        # 全体最大上限 (20分 = 1200秒)
+        overall_deadline = time.time() + 1200.0
+
+        while time.time() < overall_deadline:
+            # 1. 子プロセスが異常終了していないか検査
             if self.backend_proc.poll() is not None:
                 ret = self.backend_proc.returncode
                 self.backend_proc = None
@@ -203,7 +242,17 @@ class ModelManager:
                     self.target_model = None
                 raise RuntimeError(f"Strata バックエンドが起動処理中に異常終了しました (終了コード: {ret})")
 
-            # ポートの HTTP レスポンス検査
+            # 2. 進捗検知: ログファイルサイズの増加（エンジンが still starting 等を出力中）
+            if log_path and log_path.exists():
+                try:
+                    sz = log_path.stat().st_size
+                    if sz != last_log_size:
+                        last_log_size = sz
+                        last_progress_time = time.time()
+                except OSError:
+                    pass
+
+            # 3. ポートの HTTP レスポンス検査 (/v1/models)
             try:
                 url = f"http://{self.backend_host}:{self.backend_port}/v1/models"
                 req = urllib.request.Request(url)
@@ -223,16 +272,25 @@ class ModelManager:
                             print(f"[ルーター] ★ モデルロード完了 ({load_time:.1f} 秒): {conf['name']}", flush=True)
                             return
                         else:
-                            print(f"[ルーター] ポート応答ありだが別モデル報告中: {models_reported} (ロード待機中...)", flush=True)
+                            last_progress_time = time.time()
             except Exception:
                 pass
+
+            # 4. 180秒間ログの進捗が完全に途絶えた場合のみハングアップと判定
+            if time.time() - last_progress_time > 180.0:
+                print(f"[ルーター] 警告: モデルロードが 180 秒間進捗停止（ハングアップ）しました。", flush=True)
+                self.stop_backend()
+                with self.lock:
+                    self.target_model = None
+                raise TimeoutError("モデルロードが180秒間進捗停止したためタイムアウトしました。")
+
             time.sleep(1.0)
 
-        # 600秒タイムアウト
+        # 20分タイムアウト
         self.stop_backend()
         with self.lock:
             self.target_model = None
-        raise TimeoutError(f"モデルの起動待機がタイムアウトしました ({timeout:.0f}秒)。")
+        raise TimeoutError("モデルロードが全体最大時間 (20分) を超過しました。")
 
     def ensure_model(self, requested_model_name: str) -> tuple[bool, str]:
         """
@@ -591,10 +649,13 @@ def main():
     parser.add_argument("--default-model", default=DEFAULT_MODEL, help="起動時のデフォルトモデル")
     args = parser.parse_args()
 
-    # ルーターポートの空き確認
+    # 1. ルーターポートの空き確認
     if not is_port_available(args.host, args.port):
-        print(f"[エラー] ルーター待受ポート {args.host}:{args.port} は既に使用されています。別のポートを指定してください。", file=sys.stderr)
+        print(f"[エラー] ルーター待受ポート {args.host}:{args.port} は既に使用されています。既存のサーバーを終了するか別のポートを指定してください。", file=sys.stderr)
         sys.exit(1)
+
+    # 2. 起動前に既存の孤児・競合 Strata エンジンプロセスを一掃 (VRAM 解放)
+    cleanup_strata_engine_processes()
 
     manager = ModelManager(args.backend_host, args.backend_port, api_key=args.api_key)
     atexit.register(manager.stop_backend)
