@@ -202,20 +202,21 @@ class ModelManager:
         if self.api_key:
             cmd.extend(["--api-key", self.api_key])
 
-        self.backend_proc = subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
             env=env,
             stdout=sys.stdout,
             stderr=sys.stderr
         )
+        self.backend_proc = proc
 
         # Windows Job Object に登録 (ルーター終了時に道連れ終了)
         if winjob and os.name == "nt":
-            if winjob.contain(self.backend_proc):
-                print(f"[ルーター] プロセス PID {self.backend_proc.pid} を Job Object に登録しました。", flush=True)
+            if winjob.contain(proc):
+                print(f"[ルーター] プロセス PID {proc.pid} を Job Object に登録しました。", flush=True)
 
-        print(f"[ルーター] プロセス起動開始 (PID: {self.backend_proc.pid})。モデルロード待機中...", flush=True)
+        print(f"[ルーター] プロセス起動開始 (PID: {proc.pid})。モデルロード待機中...", flush=True)
 
         # ログファイルのパス取得
         log_path = None
@@ -234,8 +235,8 @@ class ModelManager:
 
         while time.time() < overall_deadline:
             # 1. 子プロセスが異常終了していないか検査
-            if self.backend_proc.poll() is not None:
-                ret = self.backend_proc.returncode
+            if proc.poll() is not None:
+                ret = proc.returncode
                 self.backend_proc = None
                 with self.lock:
                     self.status = "stopped"
