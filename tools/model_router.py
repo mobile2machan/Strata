@@ -85,8 +85,6 @@ def cleanup_competing_processes(exclude_pids: set[int] | None = None):
             cur_p = psutil.Process(current_pid)
             for parent in cur_p.parents():
                 exclude.add(parent.pid)
-            for child in cur_p.children(recursive=True):
-                exclude.add(child.pid)
         except Exception:
             pass
 
@@ -118,6 +116,8 @@ def cleanup_competing_processes(exclude_pids: set[int] | None = None):
                 try:
                     p_name = p.name()
                     print(f"[ルーター] 競合プロセス検出 (PID: {p.pid}, {p_name})。終了します...", flush=True)
+                    if os.name == "nt":
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True, check=False)
                     p.kill()
                 except Exception:
                     pass
@@ -167,6 +167,11 @@ class ModelManager:
         if proc:
             pid = proc.pid
             print(f"[ルーター] バックエンドプロセス (PID: {pid}) を停止中...", flush=True)
+            if os.name == "nt":
+                try:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False)
+                except Exception:
+                    pass
             try:
                 import psutil
                 try:
@@ -195,7 +200,24 @@ class ModelManager:
             time.sleep(0.5)
 
         if not is_port_available(self.backend_host, self.backend_port):
-            print(f"[ルーター] 警告: ポート {self.backend_host}:{self.backend_port} がまだ解放されていません。", flush=True)
+            print(f"[ルーター] 警告: ポート {self.backend_host}:{self.backend_port} がまだ解放されていません。ポート占有プロセスを強制終了します...", flush=True)
+            try:
+                import psutil
+                for conn in psutil.net_connections(kind='tcp'):
+                    if conn.laddr and conn.laddr.port == self.backend_port and conn.pid:
+                        try:
+                            if os.name == "nt":
+                                subprocess.run(["taskkill", "/F", "/T", "/PID", str(conn.pid)], capture_output=True, check=False)
+                            psutil.Process(conn.pid).kill()
+                            print(f"[ルーター] ポート {self.backend_port} 占有プロセス PID {conn.pid} を強制終了しました。", flush=True)
+                        except Exception:
+                            pass
+                time.sleep(1.0)
+            except Exception:
+                pass
+
+        if not is_port_available(self.backend_host, self.backend_port):
+            print(f"[ルーター] エラー: ポート {self.backend_host}:{self.backend_port} の解放に失敗しました。", flush=True)
         else:
             print(f"[ルーター] ポート {self.backend_host}:{self.backend_port} の解放を確認しました。", flush=True)
 
