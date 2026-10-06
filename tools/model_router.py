@@ -85,6 +85,7 @@ class ModelManager:
         self.status = "stopped"  # "stopped", "switching", "ready"
         self.target_model: str | None = None
         self.switch_start_time: float = 0.0
+        self.last_error: str | None = None
 
     def resolve_model(self, model_name: str) -> str | None:
         """モデル名またはエイリアスの完全一致のみを判定。部分一致は一切行わない。"""
@@ -129,12 +130,22 @@ class ModelManager:
         self.current_model = None
         self.status = "stopped"
 
-    def start_backend(self, model_key: str):
-        """指定モデルで Strata バックエンドを起動し、厳格な readiness 検証を行う"""
-        if model_key not in MODELS:
-            raise ValueError(f"未知のモデル: {model_key}")
+    def _switch_worker(self, model_key: str):
+        """別スレッドでモデル切り替えを実行するルーチン"""
+        try:
+            self._do_switch(model_key)
+        except Exception as e:
+            print(f"[ルーター] モデル切り替えに失敗しました: {e}", flush=True)
+            with self.lock:
+                self.status = "stopped"
+                self.target_model = None
+                self.last_error = str(e)
 
-        # 起動前チェック: ポートが空いているか
+    def _do_switch(self, model_key: str):
+        # 1. 既存バックエンドを停止
+        self.stop_backend()
+
+        # 2. ポート空き確認
         if not is_port_available(self.backend_host, self.backend_port):
             raise RuntimeError(
                 f"バックエンドポート {self.backend_host}:{self.backend_port} は既に使用されています。"
@@ -147,9 +158,6 @@ class ModelManager:
             raise FileNotFoundError(f"設定ファイルが見つかりません: {cfg_path}")
 
         print(f"[ルーター] 新しいモデルを起動します: {conf['name']}", flush=True)
-        self.status = "switching"
-        self.target_model = model_key
-        self.switch_start_time = time.time()
 
         env = os.environ.copy()
         for k, v in conf["env"].items():
@@ -182,19 +190,20 @@ class ModelManager:
 
         print(f"[ルーター] プロセス起動開始 (PID: {self.backend_proc.pid})。モデルロード待機中...", flush=True)
 
-        # 起動待機 (厳格な readiness 判定: 子プロセスの生死 + 子プロセスが返すモデルIDの確認)
-        timeout = 180.0
+        # 起動待機: タイムアウトを 600秒 (10分) に設定。子が生きて進捗を出している間は殺さない
+        timeout = 600.0
         deadline = time.time() + timeout
         while time.time() < deadline:
-            # 1. 子プロセスが死んでいないか検査
+            # 子プロセスが死んでいないか検査
             if self.backend_proc.poll() is not None:
                 ret = self.backend_proc.returncode
                 self.backend_proc = None
-                self.status = "stopped"
-                self.target_model = None
-                raise RuntimeError(f"Strata バックエンドが起動直後に異常終了しました (終了コード: {ret})")
+                with self.lock:
+                    self.status = "stopped"
+                    self.target_model = None
+                raise RuntimeError(f"Strata バックエンドが起動処理中に異常終了しました (終了コード: {ret})")
 
-            # 2. ポートの HTTP レスポンス検査
+            # ポートの HTTP レスポンス検査
             try:
                 url = f"http://{self.backend_host}:{self.backend_port}/v1/models"
                 req = urllib.request.Request(url)
@@ -203,52 +212,56 @@ class ModelManager:
                 with urllib.request.urlopen(req, timeout=1.0) as res:
                     if res.status == 200:
                         body = json.loads(res.read().decode("utf-8"))
-                        # モデル ID が一致するか確認
                         models_reported = [m.get("id") for m in body.get("data", [])]
-                        # config に指定された model_name または model_key が含まれるか
                         cfg_model_name = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("model_name", "")
                         if model_key in models_reported or cfg_model_name in models_reported:
-                            self.current_model = model_key
-                            self.status = "ready"
-                            self.target_model = None
+                            with self.lock:
+                                self.current_model = model_key
+                                self.status = "ready"
+                                self.target_model = None
                             load_time = time.time() - self.switch_start_time
                             print(f"[ルーター] ★ モデルロード完了 ({load_time:.1f} 秒): {conf['name']}", flush=True)
                             return
                         else:
-                            print(f"[ルーター] ポート応答ありだが別モデル報告中: {models_reported} (待機中...)", flush=True)
+                            print(f"[ルーター] ポート応答ありだが別モデル報告中: {models_reported} (ロード待機中...)", flush=True)
             except Exception:
                 pass
             time.sleep(1.0)
 
-        # タイムアウト
+        # 600秒タイムアウト
         self.stop_backend()
-        self.target_model = None
-        raise TimeoutError("モデルの起動待機がタイムアウトしました (180秒)。")
+        with self.lock:
+            self.target_model = None
+        raise TimeoutError(f"モデルの起動待機がタイムアウトしました ({timeout:.0f}秒)。")
 
     def ensure_model(self, requested_model_name: str) -> tuple[bool, str]:
         """
-        モデル切替の要求を処理。
-        返り値: (is_ready, model_key)
-        切り替え中の場合は (False, model_key) を返し、即座に 503 を返せるようにする。
+        要求モデルの状態を確認。
+        - 稼働中 (ready): (True, target) を即座に返す
+        - 切替中 (switching): (False, target) を即座に返す (HTTP 503 用)
+        - 別のモデルまたは停止中: 非同期バックグラウンド切替を開始し、(False, target) を即座に返す (HTTP 503 用)
         """
         target = self.resolve_model(requested_model_name)
         if not target:
             raise ValueError(f"未知のモデル名です: {requested_model_name}")
 
         with self.lock:
+            # 1. すでに要求モデルが ready
             if self.current_model == target and self.status == "ready":
                 return True, target
 
+            # 2. 現在切り替え中
             if self.status == "switching":
-                # 既に同一モデルへ切り替え中であれば進行中
                 return False, self.target_model or target
 
-            # 切替の開始
-            self.stop_backend()
-            # バックグラウンドスレッドで起動して 503 を返すか、ブロッキングで起動するか
-            # ここでは同期起動を行い、完了すれば True を返す
-            self.start_backend(target)
-            return True, target
+            # 3. 新規に切り替えを開始 (非同期スレッド)
+            self.status = "switching"
+            self.target_model = target
+            self.switch_start_time = time.time()
+            self.last_error = None
+            t = threading.Thread(target=self._switch_worker, args=(target,), daemon=True)
+            t.start()
+            return False, target
 
 
 class RouterHandler(BaseHTTPRequestHandler):
@@ -334,11 +347,14 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.send_cors_headers()
             self.end_headers()
             cur = self.manager.current_model
+            elapsed = round(time.time() - self.manager.switch_start_time, 1) if self.manager.status == "switching" else None
             data = {
                 "current_model": cur,
                 "current_name": MODELS[cur]["name"] if cur in MODELS else None,
                 "status": self.manager.status,
                 "target_model": self.manager.target_model,
+                "switching_elapsed_seconds": elapsed,
+                "last_error": self.manager.last_error,
                 "available_models": list(MODELS.keys())
             }
             self.wfile.write(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -369,17 +385,20 @@ class RouterHandler(BaseHTTPRequestHandler):
 
             try:
                 ready, target_key = self.manager.ensure_model(target)
+                elapsed = round(time.time() - self.manager.switch_start_time, 1)
                 if not ready:
-                    self.send_response(503)
+                    self.send_response(202)
                     self.send_header("Retry-After", "30")
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_cors_headers()
                     self.end_headers()
                     self.wfile.write(json.dumps({
-                        "error": {
-                            "message": f"Model is switching to '{target_key}'. Please retry in 30 seconds.",
-                            "type": "model_switching"
-                        }
+                        "ok": True,
+                        "status": "switching",
+                        "target_model": target_key,
+                        "name": MODELS[target_key]["name"],
+                        "message": f"Model switching to '{target_key}' in progress ({elapsed}s elapsed). Please wait ~1-3 minutes.",
+                        "elapsed_seconds": elapsed
                     }, ensure_ascii=False).encode("utf-8"))
                     return
 
@@ -389,7 +408,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({
                     "ok": True,
-                    "switched_to": target_key,
+                    "status": "ready",
+                    "current_model": target_key,
                     "name": MODELS[target_key]["name"]
                 }, ensure_ascii=False).encode("utf-8"))
                 return
@@ -443,17 +463,20 @@ class RouterHandler(BaseHTTPRequestHandler):
 
             try:
                 ready, target_key = self.manager.ensure_model(target)
+                elapsed = round(time.time() - self.manager.switch_start_time, 1)
                 if not ready:
-                    self.send_response(503)
+                    self.send_response(202)
                     self.send_header("Retry-After", "30")
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_cors_headers()
                     self.end_headers()
                     self.wfile.write(json.dumps({
-                        "error": {
-                            "message": f"Model is switching to '{target_key}'. Please retry in 30 seconds.",
-                            "type": "model_switching"
-                        }
+                        "ok": True,
+                        "status": "switching",
+                        "target_model": target_key,
+                        "name": MODELS[target_key]["name"],
+                        "message": f"Model switching to '{target_key}' in progress ({elapsed}s elapsed). Please wait ~1-3 minutes.",
+                        "elapsed_seconds": elapsed
                     }, ensure_ascii=False).encode("utf-8"))
                     return
 
@@ -463,7 +486,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({
                     "ok": True,
-                    "switched_to": target_key,
+                    "status": "ready",
+                    "current_model": target_key,
                     "name": MODELS[target_key]["name"]
                 }, ensure_ascii=False).encode("utf-8"))
                 return
@@ -494,6 +518,7 @@ class RouterHandler(BaseHTTPRequestHandler):
 
                     ready, target_key = self.manager.ensure_model(requested_model)
                     if not ready:
+                        elapsed = round(time.time() - self.manager.switch_start_time, 1)
                         self.send_response(503)
                         self.send_header("Retry-After", "30")
                         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -501,8 +526,10 @@ class RouterHandler(BaseHTTPRequestHandler):
                         self.end_headers()
                         self.wfile.write(json.dumps({
                             "error": {
-                                "message": f"Model is switching to '{target_key}'. Please retry in 30 seconds.",
-                                "type": "model_switching"
+                                "message": f"Model is currently loading: '{target_key}' ({elapsed}s elapsed, models take 1-3 minutes to load). Please retry in 30 seconds.",
+                                "type": "model_switching",
+                                "target_model": target_key,
+                                "elapsed_seconds": elapsed
                             }
                         }, ensure_ascii=False).encode("utf-8"))
                         return
@@ -584,13 +611,13 @@ def main():
     if args.api_key:
         print(" API キー認証: 有効")
     else:
-        print(" API キー認証: なし (127.0.0.1 ローカル専用)")
+        print(" API キー認証: なし (LAN / 127.0.0.1 信頼オリジン)")
     print(" 登録モデル (完全一致のみ有効):")
     for k, v in MODELS.items():
         print(f"   - {k} ({v['name']}) [aliases: {', '.join(v['aliases'])}]")
     print("=" * 70)
 
-    # 初回デフォルトモデルを起動
+    # 初回デフォルトモデルをバックグラウンドスレッドで起動
     try:
         manager.ensure_model(args.default_model)
     except Exception as e:
