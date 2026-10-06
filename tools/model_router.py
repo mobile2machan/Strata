@@ -23,14 +23,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
-PYTHON = sys.executable
-
-# winjob のインポート (Windows における子プロセス孤児化防止)
-sys.path.insert(0, str(ROOT / "serve"))
-try:
-    import winjob
-except ImportError:
-    winjob = None
+VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
+PYTHON = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
 
 # モデル構成の定義 (厳格な完全一致・エイリアス定義)
 MODELS = {
@@ -74,28 +68,70 @@ def is_port_available(host: str, port: int) -> bool:
     return True
 
 
-def cleanup_strata_engine_processes(exclude_pids: set[int] | None = None):
-    """自前の子以外の strata.exe / strata-vision.exe を終了して VRAM を全解放する"""
-    if os.name != "nt":
-        return
-    exclude = exclude_pids or set()
+def cleanup_competing_processes(exclude_pids: set[int] | None = None):
+    """
+    自前以外の以下の競合プロセスをすべて安全に強制終了し、ポート・VRAM・RAMを完全解放する:
+    1. strata.exe, strata-vision.exe
+    2. コマンドラインに server.py を含む Python プロセス
+    3. 自分自身以外の model_router.py を動かしている Python プロセス
+    """
+    exclude = set(exclude_pids or ())
+    current_pid = os.getpid()
+    exclude.add(current_pid)
+
     try:
-        out = subprocess.check_output(
-            ["tasklist", "/FI", "IMAGENAME eq strata*", "/FO", "CSV", "/NH"],
-            text=True, stderr=subprocess.DEVNULL
-        )
-        for line in out.splitlines():
-            parts = line.strip().split('","')
-            if len(parts) >= 2:
-                name = parts[0].strip('"')
-                pid_str = parts[1].strip('"')
-                if pid_str.isdigit() and ("strata.exe" in name.lower() or "strata-vision.exe" in name.lower()):
-                    pid = int(pid_str)
-                    if pid not in exclude:
-                        print(f"[ルーター] 競合するエンジンプロセス {name} (PID: {pid}) を検出。VRAM 解放のため終了します...", flush=True)
-                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False)
-    except Exception:
-        pass
+        import psutil
+        try:
+            cur_p = psutil.Process(current_pid)
+            for parent in cur_p.parents():
+                exclude.add(parent.pid)
+            for child in cur_p.children(recursive=True):
+                exclude.add(child.pid)
+        except Exception:
+            pass
+
+        procs_to_kill = []
+        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                pid = p.info['pid']
+                if pid in exclude:
+                    continue
+                name = (p.info['name'] or '').lower()
+                cmdline = ' '.join(p.info['cmdline'] or []).lower()
+
+                should_kill = False
+                if name in ('strata.exe', 'strata-vision.exe'):
+                    should_kill = True
+                elif 'python' in name:
+                    if 'server.py' in cmdline and ('strata' in cmdline or 'serve' in cmdline):
+                        should_kill = True
+                    elif 'model_router.py' in cmdline and pid not in exclude:
+                        should_kill = True
+
+                if should_kill:
+                    procs_to_kill.append(p)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        if procs_to_kill:
+            for p in procs_to_kill:
+                try:
+                    p_name = p.name()
+                    print(f"[ルーター] 競合プロセス検出 (PID: {p.pid}, {p_name})。終了します...", flush=True)
+                    p.kill()
+                except Exception:
+                    pass
+            # 終了を待機
+            gone, alive = psutil.wait_procs(procs_to_kill, timeout=5.0)
+            for p in alive:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            # WDDM / ドライバの VRAM / メモリ解放を待つクールダウン
+            time.sleep(1.5)
+    except Exception as e:
+        print(f"[ルーター] プロセスクリーンアップ中に警告: {e}", flush=True)
 
 
 class ModelManager:
@@ -125,22 +161,31 @@ class ModelManager:
         return None
 
     def stop_backend(self):
-        """バックエンドプロセスを停止し、残存エンジンを強制一掃してポートおよび VRAM を完全解放する"""
-        if self.backend_proc:
-            pid = self.backend_proc.pid
+        """バックエンドプロセスツリーを停止し、残存エンジンを強制一掃してポートおよび VRAM を完全解放する"""
+        proc = self.backend_proc
+        self.backend_proc = None
+        if proc:
+            pid = proc.pid
             print(f"[ルーター] バックエンドプロセス (PID: {pid}) を停止中...", flush=True)
             try:
-                if os.name == "nt":
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                                   capture_output=True, check=False)
-                else:
-                    self.backend_proc.terminate()
+                import psutil
+                try:
+                    parent = psutil.Process(pid)
+                    children = parent.children(recursive=True)
+                    for child in children:
+                        try:
+                            child.kill()
+                        except Exception:
+                            pass
+                    parent.kill()
+                    psutil.wait_procs(children + [parent], timeout=5.0)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
             except Exception as e:
                 print(f"[ルーター] プロセス停止中にエラー: {e}", flush=True)
-            self.backend_proc = None
 
-        # 孤立した strata.exe / strata-vision.exe を完全に一掃し、VRAM を 100% 解放
-        cleanup_strata_engine_processes()
+        # 孤立した strata.exe / strata-vision.exe / 古い server.py を完全に一掃し、VRAM を 100% 解放
+        cleanup_competing_processes()
 
         # ポート解放の待機検査
         deadline = time.time() + 10.0
@@ -210,11 +255,6 @@ class ModelManager:
             stderr=sys.stderr
         )
         self.backend_proc = proc
-
-        # Windows Job Object に登録 (ルーター終了時に道連れ終了)
-        if winjob and os.name == "nt":
-            if winjob.contain(proc):
-                print(f"[ルーター] プロセス PID {proc.pid} を Job Object に登録しました。", flush=True)
 
         print(f"[ルーター] プロセス起動開始 (PID: {proc.pid})。モデルロード待機中...", flush=True)
 
@@ -645,7 +685,7 @@ def main():
     parser.add_argument("--host", default="0.0.0.0", help="ルーター待受ホスト (デフォルト: 0.0.0.0 - LANアクセス許可)")
     parser.add_argument("--port", type=int, default=8080, help="ルーター待受ポート (デフォルト: 8080)")
     parser.add_argument("--backend-host", default="127.0.0.1", help="Strata バックエンドホスト (デフォルト: 127.0.0.1)")
-    parser.add_argument("--backend-port", type=int, default=8091, help="Strata バックエンドポート (デフォルト: 8091)")
+    parser.add_argument("--backend-port", type=int, default=8081, help="Strata バックエンドポート (デフォルト: 8081)")
     parser.add_argument("--api-key", default="", help="クライアント認証およびバックエンドに渡す API キー")
     parser.add_argument("--default-model", default=DEFAULT_MODEL, help="起動時のデフォルトモデル")
     args = parser.parse_args()
@@ -656,7 +696,7 @@ def main():
         sys.exit(1)
 
     # 2. 起動前に既存の孤児・競合 Strata エンジンプロセスを一掃 (VRAM 解放)
-    cleanup_strata_engine_processes()
+    cleanup_competing_processes()
 
     manager = ModelManager(args.backend_host, args.backend_port, api_key=args.api_key)
     atexit.register(manager.stop_backend)
