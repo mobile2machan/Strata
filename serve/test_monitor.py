@@ -257,5 +257,95 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertIn(f'"{el}"', js)
 
 
+class PcieDoneEngine(MockEngine):
+    """The mock engine whose `last` and PCIe bytes come from a DONE line, parsed as StrataEngine parses it."""
+
+    def __init__(self, *a, done_lines=(), **kw):
+        super().__init__(*a, **kw)
+        self.done_lines = list(done_lines)
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        from serve.server import StrataEngine
+        try:
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+        finally:
+            StrataEngine._parse_done(self, self.done_lines.pop(0))
+
+
+class PcieSeries(unittest.TestCase):
+    """The Monitor's PCIe graph on the AMD backend.  The driver has no PCIe byte counter there:
+    amdsmi_get_gpu_pci_throughput, rsmi_dev_pci_throughput_get and amdsmi_get_pcie_info all answer NOT_SUPPORTED on
+    gfx1201 (measured on the R9700), so the series is the engine's own host -> VRAM traffic - the routed experts it
+    read over PCIe (the DONE line's 16th field, #588) at the expert cache's blob size, plus the K/V blocks the KV
+    streaming read from RAM (its cumulative log line)."""
+
+    KV5 = "strata serve: KV streaming: 90.00% of 1000 block reads hit VRAM, 5.0 MiB read from RAM\n"
+
+    def test_the_log(self):
+        from serve.server import KvStreamLog
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text("strata serve: KV streaming: 1.00% of 9 block reads hit VRAM, 99.0 MiB read from RAM\n",
+                           encoding="utf-8")
+            start = log.stat().st_size                 # this run starts here: the earlier run's total is not counted
+            k = KvStreamLog()
+            self.assertEqual(k.poll(str(log), start), 0.0)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("strata serve: something else\n" + self.KV5 + "strata serve: KV streaming: 91.0% of 2000 block")
+            self.assertEqual(k.poll(str(log), start), 5.0)         # the cut line is read once it is whole
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(" reads hit VRAM, 12.5 MiB read from RAM\n")
+            self.assertEqual(k.poll(str(log), start), 12.5)        # cumulative: the newest line wins
+            self.assertEqual(k.poll(str(log), log.stat().st_size), 0.0)   # the engine started again
+            self.assertEqual(k.poll(None, None), 0.0)
+
+    def test_the_experts_count_at_the_blob_size(self):
+        from serve.server import StrataEngine
+        e = StrataEngine.__new__(StrataEngine)
+        e.info, e.batch, e.last, e.pcie_expert_bytes = {"expert_slots": 400, "expert_cache_mib": 800}, 0, {}, 0
+        blob = 800 * 1048576 // 400
+        self.assertEqual(e.expert_blob_bytes(), blob)
+        e._parse_done("DONE 4 20 40.0 30.0 stop 3 5 10 100 200 5 3 1 17 25")
+        self.assertEqual((e.last["offloaded"], e.pcie_expert_bytes), (25, 25 * blob))
+        e._parse_done("DONE 4 20 40.0 30.0 stop 3 5 10 100 200 5 3 1 17")   # an engine that reports no 16th field
+        self.assertEqual((e.last.get("offloaded"), e.pcie_expert_bytes), (None, 25 * blob))
+        e.info = {}
+        self.assertEqual(e.expert_blob_bytes(), 0)
+
+    def test_the_graph_has_a_series(self):
+        from serve.server import StrataEngine
+        tok = ByteTokenizer()
+        # delay_s: the request must land inside the rate window.  A mock answer is instant, so its DONE line would
+        # arrive before the sampler's first point and every point of the window would carry the same total - 0.0.
+        engine = PcieDoneEngine(tok, "</think>\n\nok", max_context=4096, delay_s=0.4, done_lines=[
+            "DONE 4 20 40.0 30.0 stop 3 5 10 100 200 5 3 1 17 400"])
+        engine.info = {"expert_slots": 400, "expert_cache_mib": 800}
+        engine.pcie_expert_bytes = 0
+        engine.log_path, engine.log_start = None, None
+        engine.expert_blob_bytes = StrataEngine.expert_blob_bytes.__get__(engine)
+        svc = Service(engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        svc.backend = "hip"
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            req = urllib.request.Request(base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
+                                         data=json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode())
+            with urllib.request.urlopen(req, timeout=30) as r:
+                r.read()
+            self.assertEqual(engine.pcie_expert_bytes, 400 * (800 * 1048576 // 400))
+            # the window is a minute wide: the request's bytes read as a positive rate from five seconds after the
+            # DONE line until the window has passed them - poll for that, not for the first number that arrives
+            v, deadline = None, time.time() + 90
+            while not (isinstance(v, float) and v > 0) and time.time() < deadline:
+                with urllib.request.urlopen(base + "/metrics", timeout=10) as r:
+                    v = json.loads(r.read())["hardware"].get("gpu_pcie_rx_mb")
+                time.sleep(1)
+            self.assertGreater(v or 0.0, 0.0, f"the Monitor's PCIe series stayed {v!r}")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

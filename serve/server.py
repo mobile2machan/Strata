@@ -198,6 +198,8 @@ CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > co
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
 RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean so far, with the span floored here
+PCIE_RATE_WINDOW_S = 60.0   # the engine accounts its PCIe bytes per finished request: the graph's mean over a minute,
+#                             so one long request's bytes read as its real rate, not as a spike in one second
 # #481: a running request whose engine prints nothing (no T, PP or any other line) for this long has lost step with the
 # server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
 # the next request starts it again.  The config's "engine_silence_s" sets it (0: wait forever, as before).
@@ -230,6 +232,7 @@ class MockEngine:
                                                                                  else script)]
         self.script, self.turns = self.scripts[0], 0
         self.last_prompt: list[int] = []
+        self.pcie_expert_bytes = 0       # the DONE line's experts read over PCIe, as StrataEngine accumulates them
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_prompt = list(ids)
@@ -243,6 +246,9 @@ class MockEngine:
             if self.delay:
                 time.sleep(self.delay)
             yield t
+
+    def expert_blob_bytes(self) -> int:
+        return 0                         # the mock has no expert cache to price a blob at
 
 
 class EngineDied(RuntimeError):
@@ -500,6 +506,46 @@ class ConvCacheLog:
         return dict(self.state)
 
 
+class KvStreamLog:
+    """The K/V the KV streaming read from RAM - bytes over the PCIe link - as the engine's log tells it: after every
+    request it writes "strata serve: KV streaming: 93.28% of 277296 block reads hit VRAM, 75.0 MiB read from RAM" to
+    stderr, cumulative over the engine's run.  The AMD driver reports no PCIe byte counter, so the Monitor's PCIe
+    graph is built from this and from the DONE line's expert reads.  The same tail reading as ConvCacheLog (#596):
+    on from where it was last read, from the start of the engine's current run."""
+    LINE = re.compile(r"KV streaming: [0-9.]+% of \d+ block reads hit VRAM, ([0-9.]+) MiB read from RAM")
+    READ_MAX = 1 << 20
+
+    def __init__(self):
+        self.key, self.pos, self.mib = None, 0, 0.0
+
+    def poll(self, path, start) -> float:
+        """The engine's cumulative MiB read from RAM; `start` is where the engine's current run began in the log."""
+        if not path or start is None:
+            return self.mib
+        if self.key != (path, start):                   # another start of the engine: its counters start over
+            self.key, self.pos, self.mib = (path, start), start, 0.0
+        try:
+            size = os.path.getsize(path)
+            if size < self.pos:                         # the log was emptied or replaced
+                self.pos = 0
+            if size - self.pos > self.READ_MAX:
+                self.pos = size - self.READ_MAX
+            with open(path, "rb") as f:
+                f.seek(self.pos)
+                data = f.read(size - self.pos)
+        except OSError:
+            return self.mib
+        end = data.rfind(b"\n") + 1                     # whole lines only: the rest is read next time
+        self.pos += end
+        for line in data[:end].decode("utf-8", "replace").splitlines():
+            if "KV streaming:" not in line:
+                continue
+            m = self.LINE.search(line)
+            if m:
+                self.mib = float(m.group(1))
+        return self.mib
+
+
 def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
     --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back."""
@@ -572,6 +618,7 @@ class StrataEngine:
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
+        self.pcie_expert_bytes = 0       # bytes the GPU read over PCIe, cumulative for this engine process
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
@@ -786,6 +833,15 @@ class StrataEngine:
                 self.slot_cv.notify_all()        # new engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
 
+    def expert_blob_bytes(self) -> int:
+        """One expert-cache slot's bytes: the INFO line gives the cache as slots and MiB, and it is slots x blob.
+        0 when the engine has not said (then the PCIe figure counts the K/V only, which is what it can know)."""
+        mib, slots = self.info.get("expert_cache_mib"), self.info.get("expert_slots")
+        if isinstance(mib, int) and isinstance(slots, int) and slots > 0:
+            return mib * 1048576 // slots
+        return 0
+
+
     def _parse_done(self, line):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
@@ -800,6 +856,7 @@ class StrataEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
+            self.pcie_expert_bytes += int(f[15]) * self.expert_blob_bytes()
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -2160,6 +2217,8 @@ class Service:
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
+        self.kv_log = KvStreamLog()                     # the K/V read from RAM, from the engine's log (the PCIe graph)
+        self._pcie_pts = collections.deque(maxlen=70)   # (time, PCIe bytes) at each telemetry sample
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -2509,11 +2568,15 @@ class Service:
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
+            hip = getattr(self, "backend", None) == "hip"
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
-                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean()},
+                                                       "prefill_tok_s_mean": self._prefill_tok_s_mean(),
+                                                       # the driver's PCIe throughput exists only on NVIDIA; on the
+                                                       # AMD backend the series is the engine's own host -> VRAM traffic
+                                                       **({"gpu_pcie_rx_mb": self._pcie_rx_mb()} if hip else {})},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
-                                       amd=getattr(self, "backend", None) == "hip")
+                                       amd=hip)
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
@@ -2550,6 +2613,24 @@ class Service:
         with self.status_lock:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
+
+    def _pcie_rx_mb(self):
+        """MB/s the engine moved host -> VRAM over its PCIe link, averaged over the last PCIE_RATE_WINDOW_S: the routed
+        experts the GPU read over PCIe (the DONE line's 16th field, #588) at the cache's blob size, plus the K/V blocks
+        the KV streaming read from RAM (the engine's cumulative log line).  The AMD driver exposes no PCIe byte
+        counter - amdsmi_get_gpu_pci_throughput, rsmi_dev_pci_throughput_get and amdsmi_get_pcie_info all answer
+        NOT_SUPPORTED on gfx1201 - so on the HIP backend this is the only live figure the Monitor's PCIe graph can
+        have.  The engine accounts these bytes per finished request, so this is the window's mean, not an
+        instantaneous reading; None until the window spans at least a second."""
+        eng = self.engine
+        kv_mib = self.kv_log.poll(getattr(eng, "log_path", None), getattr(eng, "log_start", None))
+        now = time.time()
+        self._pcie_pts.append((now, getattr(eng, "pcie_expert_bytes", 0) + kv_mib * 1048576.0))
+        oldest = next(((t, b) for t, b in self._pcie_pts if now - t <= PCIE_RATE_WINDOW_S), None)
+        newest = self._pcie_pts[-1]
+        if oldest is None or newest[0] - oldest[0] < 5.0:
+            return None
+        return max(0.0, (newest[1] - oldest[1]) / (newest[0] - oldest[0]) / 1048576.0)
 
     def begin_request(self, path, req):
         """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""

@@ -3199,7 +3199,9 @@ class AmdTelemetry(unittest.TestCase):
                          (2, "simd_count 128\ngfx_target_version 120001\ndrm_render_minor 128\n")):
             (nodes / str(n)).mkdir(parents=True)
             (nodes / str(n) / "properties").write_text(props)
-        for minor, used, busy, temp, power in ((129, 2 << 30, 37, 51000, 85000000), (128, 6 << 30, 99, 64000, None)):
+        for minor, used, busy, temp, power, width, speed in (
+                (129, 2 << 30, 37, 51000, 85000000, 16, "32.0 GT/s PCIe"),
+                (128, 6 << 30, 99, 64000, None, 8, "16.0 GT/s PCIe")):
             dev = Path(d) / f"class/drm/renderD{minor}/device"
             hw = dev / "hwmon" / "hwmon4"
             hw.mkdir(parents=True)
@@ -3213,6 +3215,10 @@ class AmdTelemetry(unittest.TestCase):
             else:
                 (hw / "power1_input").write_text("120000000\n")
             (hw / "power1_cap").write_text("300000000\n")
+            (dev / "current_link_width").write_text(f"{width}\n")
+            (dev / "current_link_speed").write_text(f"{speed}\n")
+            (dev / "max_link_width").write_text(f"{width}\n")
+            (dev / "max_link_speed").write_text("32.0 GT/s PCIe\n")
 
     def test_readings(self):
         from serve import telemetry
@@ -3225,10 +3231,12 @@ class AmdTelemetry(unittest.TestCase):
                 g = telemetry.gpu_reader(0, amd=True)
                 self.assertTrue(g.ok())
                 self.assertEqual(g.name(), "AMD Radeon AI PRO R9700")
-                self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30, "temp": 51.0,
-                                            "power": 85.0, "power_limit": 300.0})
+                self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30,
+                                            "pcie_width": 16, "pcie_gen": 5, "pcie_gen_max": 5,
+                                            "temp": 51.0, "power": 85.0, "power_limit": 300.0})
                 r = telemetry.gpu_reader(1, amd=True).read()
                 self.assertEqual((r["util"], r["temp"], r["power"]), (99, 64.0, 120.0))     # power1_input
+                self.assertEqual((r["pcie_width"], r["pcie_gen"], r["pcie_gen_max"]), (8, 4, 5))   # a x8 Gen4 link
                 self.assertEqual(telemetry.free_vram_mib(0, amd=True), 30 << 10)
                 self.assertIsNone(telemetry.free_vram_mib(5, amd=True))
                 t = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True)

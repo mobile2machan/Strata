@@ -3,7 +3,10 @@
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
 - GPU: NVIDIA's own NVML library (nvml.dll / libnvidia-ml.so.1, installed with every driver) through ctypes, so no
   pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.  With the AMD backend (#301): the
-  amdgpu driver's Linux sysfs files - load, VRAM, temperature and power.
+  amdgpu driver's Linux sysfs files - load, VRAM, temperature, power and the PCIe link's generation and width.  The
+  driver has NO PCIe byte counter for AMD: amdsmi_get_gpu_pci_throughput, rsmi_dev_pci_throughput_get and
+  amdsmi_get_pcie_info all answer NOT_SUPPORTED on gfx1201 (measured), so the AMD backend has no pcie_rx_mb here -
+  the server supplies that series from the engine's own host -> VRAM traffic (serve/server.py: _pcie_rx_mb).
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
