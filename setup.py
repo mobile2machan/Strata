@@ -3745,7 +3745,7 @@ def choices_from_config(cfg_path: Path) -> dict:
     esp_path = esp.rsplit(":", 1)[0] if esp else None
     return {"family": family, "model": model if model in MODELS else None,
             "context": int(val("--max-context")) if val("--max-context") else None,
-            "kv": val("--kv") if val("--kv") in ("int8", "q4_0") else None,
+            "kv": val("--kv") if val("--kv") in ("int8", "q4_0", "k8v4") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
             "esp": ("on" if Path(esp_path).name == ESP_VECTOR.name else esp_path) if esp_path else "off",
             "host": cfg.get("host"), "api_key": cfg.get("api_key"), "port": cfg.get("port"), "gpu": cfg.get("gpu"),
@@ -4224,7 +4224,7 @@ PARALLEL_COST_NOTE = ("parallel N reduces waiting for several users but costs ab
 def parallel_slot_gb(ctx: int, kv: str, streaming: bool) -> float:
     """#465: the VRAM one batch slot's session takes: its KV cache (12 QSA layers; with KV streaming only the 32K
     positions the attention reads stay in VRAM) and the DeltaNet state (~0.17 GB).  Measured: 0.56 GiB at 32K int8."""
-    kv_tok = 12 * (576 if kv == "q4_0" else 1056)
+    kv_tok = 12 * KV_CELL_BYTES.get(kv, 1056)      # 576 q4_0, 816 k8v4, 1056 int8 / fp16
     return (min(ctx, 32768) if streaming else ctx) * kv_tok / 1e9 + 0.17
 
 
