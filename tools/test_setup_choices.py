@@ -538,5 +538,16 @@ class CudaVision(unittest.TestCase):
                 self.assertIn(f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}", built[0][1])
 
 
+class KvChoice(unittest.TestCase):
+    """The KV answer setup reads back from a config: every format the engine takes, k8v4 included."""
+
+    def test_every_engine_kv_is_kept(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "strata-q2_0.json"
+            for kv in ("int8", "q4_0", "k8v4"):
+                with self.subTest(kv=kv):
+                    p.write_text(json.dumps({"args": ["--max-context", "8192", "--kv", kv]}))
+                    self.assertEqual(setup.choices_from_config(p)["kv"], kv)
+
 if __name__ == "__main__":
     unittest.main()

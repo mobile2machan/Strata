@@ -15,6 +15,9 @@ class Parallel(unittest.TestCase):
         # KV streaming keeps only the attention's 32K positions in VRAM, whatever the context
         self.assertEqual(S.parallel_slot_gb(262144, "int8", True), S.parallel_slot_gb(32768, "int8", False))
         self.assertLess(S.parallel_slot_gb(32768, "q4_0", False), S.parallel_slot_gb(32768, "int8", False))
+        # k8v4 is 816 B/cell (KV_CELL_BYTES), not the int8 figure it used to be sized with
+        self.assertLess(S.parallel_slot_gb(32768, "k8v4", False), S.parallel_slot_gb(32768, "int8", False))
+        self.assertAlmostEqual(S.parallel_slot_gb(32768, "k8v4", False), 12 * 816 * 32768 / 1e9 + 0.17, delta=0.01)
 
     def test_recommendation_only_where_the_experts_mostly_fit(self):
         q2, iq3s = S.MODELS["Q2_0"]["arena_gb"], S.MODELS["IQ3_S"]["arena_gb"]
