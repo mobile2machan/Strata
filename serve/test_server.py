@@ -2755,7 +2755,8 @@ class SharedSettings(unittest.TestCase):
 
     def test_other_apps_get_the_chat_settings(self):
         d = {"temperature": 0.3, "top_p": 0.9, "top_k": 10, "seed": 7, "max_tokens": 77,
-             "reasoning_effort": "low", "experimental_speed_projection": False}
+             "reasoning_effort": "low", "experimental_speed_projection": False,
+             "repetition_penalty": 1.15, "penalty_last_n": 64}
         code, b = self.req("/settings", {"defaults": d})
         self.assertEqual(code, 200, b)
         self.assertTrue(b["shared"])
@@ -2763,7 +2764,8 @@ class SharedSettings(unittest.TestCase):
         code, _ = self.chat()                                        # a client that sets nothing
         self.assertEqual(code, 200)
         got = self.engine.last_sampling
-        for k in ("temperature", "top_p", "top_k", "seed", "experimental_speed_projection"):
+        for k in ("temperature", "top_p", "top_k", "seed", "experimental_speed_projection",
+                  "repetition_penalty", "penalty_last_n"):
             self.assertEqual(got[k], d[k], k)
         self.assertEqual(self.engine.last_max_new, 77)
         code, _ = self.chat(temperature=0.9, max_tokens=5)          # its own values win
@@ -2773,6 +2775,10 @@ class SharedSettings(unittest.TestCase):
         self.assertEqual(r["reasoning_effort"], "low")
         self.assertEqual(self.svc.with_shared({"reasoning_effort": "high"}, "openai")["reasoning_effort"], "high")
         self.assertEqual(self.svc.with_shared({}, "anthropic")["output_config"], {"effort": "low"})
+        code, b = self.req("/settings", {"defaults": {"repetition_penalty": 3}})
+        self.assertEqual(code, 400, b)
+        code, b = self.req("/settings", {"defaults": {"penalty_last_n": 600}})
+        self.assertEqual(code, 400, b)
 
     def test_off_again(self):
         self.req("/settings", {"defaults": {"temperature": 0.3}})

@@ -1253,6 +1253,13 @@ the speculative decoding checks at once, exactly as if it decoded one token at a
 each batch got them). That makes requests with penalties 1-11% slower than in 0.1.18: the draft layer guesses
 without penalties, so more of its guesses are now rejected. Requests without penalties are unchanged. `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
 
+The web app's Sampling drawer sets the two penalty fields by default: **Repetition penalty** 1.15 and **Penalty
+window** 64, and **Use for other apps too** carries them to `POST /settings`. Measured on one box (RTX PRO 4000
+Blackwell + RTX 3090, swift IQ2_XS, `--spec 4`): 16 requests at temperature 0.6 / top_p 0.95 / top_k 20 with no
+penalty put 1 answer into a loop - 1,519 of its 2,545 characters were one 32-character phrase repeated 47 times,
+and the answer ended inside the loop. The same prompt 8 times with 1.15 over 64 kept the largest loop share at
+1.8% and cost 7% of decode speed (103.7 vs 111.6 tok/s).
+
 **Batch MTP on a layer split (`--batch-mtp`).** Our measurement on 2x R9700 with all experts in VRAM: 80.2 -> 62.7 tok/s (-21.9%, 0/5 pairs faster) against the pipelined default, so it pays only when the experts do not all fit in VRAM (docs/BATCHING.md).
 
 **Token biases (opt-in).** The chat API supports request-scoped `logit_bias` objects and token/bias pair lists on supporting CUDA/HIP engines without continuous batching. A value of -100 (or `false` in a pair list) excludes a token. Unsupported engines return an error. See [LOGIT_BIAS.md](LOGIT_BIAS.md) for formats, limits and validation.
