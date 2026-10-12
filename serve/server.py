@@ -6512,7 +6512,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
 
 
 SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "top_p", "top_k", "seed", "max_tokens",
-               "experimental_speed_projection")
+               "experimental_speed_projection", "repetition_penalty", "penalty_last_n")
 
 
 def clean_shared_defaults(d) -> dict:
@@ -6543,6 +6543,13 @@ def clean_shared_defaults(d) -> dict:
             if not number or value != int(value) or value <= 0:
                 raise ValueError(f"{key}: a positive integer")
             value = int(value)
+        elif key == "repetition_penalty":
+            if not number or not 1 <= value <= 2:
+                raise ValueError("repetition_penalty: 1..2 (1 = off)")
+        elif key == "penalty_last_n":
+            if not number or value != int(value) or not 0 <= value <= 512:
+                raise ValueError("penalty_last_n: an integer 0..512 (0: no window)")
+            value = int(value)
         elif key == "reasoning_budget_tokens":                 # #123: 0 means no budget, so 0 is allowed here
             if not number or value != int(value) or value < 0:
                 raise ValueError("reasoning_budget_tokens: a whole number of tokens (0: no budget)")
@@ -6552,7 +6559,7 @@ def clean_shared_defaults(d) -> dict:
                 raise ValueError("experimental_speed_projection: true or false")
         else:
             raise ValueError(f"unknown setting {key!r}")
-        out[key] = float(value) if key in ("temperature", "top_p") else value
+        out[key] = float(value) if key in ("temperature", "top_p", "repetition_penalty") else value
     return out
 
 
