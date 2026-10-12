@@ -35,7 +35,8 @@ MODELS = {
         "env": {
             "STRATA_SPLIT_OWN": "1",
             "STRATA_GR_DOWN_MAX4": "1",
-            "STRATA_PF_FUSED": "1"
+            "STRATA_PF_FUSED": "1",
+            "STRATA_NAN_GUARD": "1"
         }
     },
     "qwen3.8-flash-next-iq3_s-dual-gpu": {
@@ -45,7 +46,8 @@ MODELS = {
         "env": {
             "STRATA_SPLIT_OWN": "1",
             "STRATA_GR_DOWN_MAX4": "1",
-            "STRATA_PF_FUSED": "1"
+            "STRATA_PF_FUSED": "1",
+            "STRATA_NAN_GUARD": "1"
         }
     }
 }
