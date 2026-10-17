@@ -66,3 +66,5 @@ build-vision-cuda12.bat
 /data/expert-profile-learned.bin
 # Local server-config backups (the config itself is ignored above)
 /strata-*.json.bak
+# local Windows HIP packaging output
+dist-hip/
