@@ -52,6 +52,8 @@ Cache hit over the follow-up turns: 68.7 % (68.6-68.7); earlier-turn tokens read
 
 Per-request data: `results.json`. Engine log lines from the start: `engine-log-excerpt.txt` (when this run started the server).
 
+The hipBLASLt calibration rows this card's run loaded (gfx1201, hipBLASLt 1.2.0): `gfx1201-hipblaslt-100200.txt`. Recorded as measurement data only; the release matrix ships no gfx1201 table for hipBLASLt 1.2.0 (docs/AMD_HIP.md), so this file is not a package table and no test reads it from `tools/hip`.
+
 ## Correctness and limitations
 
 Not measured: this is a speed suite. The conversation uses the model's own replies, so token counts differ a little between runs. Machine details come from the server, `nvidia-smi`/`rocm-smi` and the OS; background load and power limits are not recorded. Total time of the suite: 215 s.
