@@ -58,12 +58,12 @@ function strataUrl() {
  */
 async function probeStrata(baseUrl) {
   try {
-    const res = await fetch(`${baseUrl.replace(/\/v1$/, '')}/v1/status`, { signal: AbortSignal.timeout(900) });
+    const key = (process.env.STRATA_SERVER_API_KEY || process.env.STRATA_API_KEY || '').trim(), headers = key ? { authorization: `Bearer ${key}` } : {}; const res = await fetch(`${baseUrl.replace(/\/v1$/, '')}/v1/status`, { headers, signal: AbortSignal.timeout(2000) });
     if (!res.ok) return null;
     const status = await res.json().catch(() => null);
     if (!status || typeof status !== 'object') return null;
     if (status.service !== 'strata') return null;
-    const models = await fetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(900) })
+    const models = await fetch(`${baseUrl}/models`, { headers, signal: AbortSignal.timeout(2000) })
       .then((r) => (r.ok ? r.json() : null))
       .catch(() => null);
     return {
@@ -209,7 +209,7 @@ export async function streamChat({ message, history = [], systemPrompt = '', mod
       signal,
       supervised: false,
       engine,
-      modelId: be.modelId || 'strata',
+      modelId: be.modelId || 'strata', authorization: (process.env.STRATA_SERVER_API_KEY || process.env.STRATA_API_KEY || '').trim() || undefined,
     });
   }
 

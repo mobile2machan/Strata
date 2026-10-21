@@ -277,7 +277,8 @@ function set(patch: Partial<AppState> | ((s: AppState) => Partial<AppState>)) {
   state = { ...state, ...next };
   // Opening another chat shows that chat's model choice and whether that chat is mid-turn.
   if (state.activeSession !== before) {
-    const chosen = state.sessions.find(s => s.id === state.activeSession)?.preferences?.remoteModel ?? null;
+    const first = !nativeState()?.instances.some(i => i.status === 'ready') && !state.library?.loaded ? state.providers?.connections.find(c => c.models.length > 0) : null;
+    const chosen = state.sessions.find(s => s.id === state.activeSession)?.preferences?.remoteModel ?? (first ? { connectionId: first.id, modelId: first.models[0].id } : null);
     state = { ...state, remoteModel: 'remoteModel' in next ? state.remoteModel : chosen, streaming: !!state.activeSession && liveTurns.has(state.activeSession) };
   }
   for (const l of listeners) l();
@@ -315,7 +316,8 @@ export function selectRemoteModel(remoteModel: RemoteModelSelection | null) {
 function applyProviders(providers: ModelProviders) {
   // A chat whose API model was removed keeps its choice: the next send says the model is gone, rather
   // than quietly answering from the local model.
-  set({ providers });
+  const first = !state.remoteModel && !nativeState()?.instances.some(i => i.status === 'ready') && !state.library?.loaded ? providers.connections.find(c => c.models.length > 0) : null;
+  set({ providers, ...(first ? { remoteModel: { connectionId: first.id, modelId: first.models[0].id } } : {}) });
 }
 export async function saveModelConnection(draft: ModelConnectionDraft) {
   applyProviders(await api.post<ModelProviders>('/api/model-providers', draft));

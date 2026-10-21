@@ -80,6 +80,7 @@ export async function chooseFolder(prompt, options = {}) {
       return { cancelled: true }; // dismissing the dialog is an exit code, not a failure
     }
   }
+  if (platform === 'win32' && !options.run && !options.windowsDialog) return { unavailable: true, reason: 'Browse or enter the folder path below.' };
   if (platform === 'win32') {
     const shell = `${process.env.SystemRoot || 'C:\\Windows'}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
     try {

@@ -55,7 +55,7 @@ import { RequestQueue } from './request-queue.mjs';
 import { selectSkills, skillInstructions } from './skill-selection.mjs';
 import { createModelProviders } from './model-providers.mjs';
 import { createForkTimeskip } from './timeskip-fork.mjs';
-import { createChatFolders, chatRootOf, openFile, resolveChatFile, previewFile, rawFile, createAttachments, withAttachments } from './chat-files.mjs';
+import { createChatFolders, chatRootOf, isInside, openFile, resolveChatFile, previewFile, rawFile, createAttachments, withAttachments } from './chat-files.mjs';
 import { createLlmProxy, samplingFromExpert } from './agent/llm-shape.mjs';
 import { checkUpdates, checkComponentUpdates } from './updates.mjs';
 import { plainNoModel } from './no-model-text.mjs';
@@ -545,7 +545,7 @@ function clientName(req) {
   return 'Local client';
 }
 
-async function runRemoteTurn({ selection, message, history, images = [], onFrame, signal, workspaceId }) {
+async function runRemoteTurn({ selection, message, history, images = [], onFrame, signal, workspaceId, sessionId = null }) {
   const controller = new AbortController();
   const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   let entry;
@@ -553,9 +553,25 @@ async function runRemoteTurn({ selection, message, history, images = [], onFrame
   try {
     const { connection, model } = modelProviders.resolve(selection);
     const appliedSkills = selectSkills(skillState, message, workspaceId);
+    const cwd = (sessionId ? chatFolders.get(sessionId) : null) ?? (workspaceId ? workspaces.find(w => w.id === workspaceId)?.path : null) ?? WORKSPACE;
+    const attached = sessionId ? chatAttachments.take(sessionId) : [];
+    const attachedText = attached.map(filePath => {
+      try {
+        const st = statSync(filePath);
+        if (!st.isFile() || st.size > 200 * 1024) return `[Attached file: ${filePath}]`;
+        const content = readFileSync(filePath, 'utf8');
+        if (content.slice(0, 1024).includes('\u0000')) return `[Attached binary file: ${filePath}]`;
+        return `<file path="${filePath}">\n${content}\n</file>`;
+      } catch {
+        return '';
+      }
+    }).filter(Boolean).join('\n\n');
+    const candidateList = readableCandidates(cwd, 2).slice(0, 40);
+    const workspacePrompt = cwd ? `Current project folder: ${cwd}\n${candidateList.length ? `Files in project folder:\n${candidateList.map(f => `- ${f}`).join('\n')}` : ''}` : '';
+    const fullMessage = attachedText ? `${attachedText}\n\n${message}` : message;
     entry = serving.open({ client: 'Strata chat', endpoint: connection.protocol === 'anthropic' ? '/messages' : connection.protocol === 'openai-responses' ? '/responses' : '/chat/completions', model: `${connection.name} · ${model.name}`, cancel: () => controller.abort(new DOMException('Cancelled by the user', 'AbortError')) });
     serving.mark(entry.id, { state: 'generating' });
-    const result = await modelProviders.stream({ selection, message, history, images, signal: requestSignal, systemPrompt: ['You are Strata, a helpful assistant. Answer clearly. Do not claim to have read files or performed actions unless their results are included in the conversation.', skillInstructions(appliedSkills)].filter(Boolean).join('\n\n'), onFrame: frame => {
+    const result = await modelProviders.stream({ selection, message: fullMessage, history, images, signal: requestSignal, systemPrompt: ['You are Strata, a helpful assistant. Answer clearly. Do not claim to have read files or performed actions unless their results are included in the conversation.', workspacePrompt, skillInstructions(appliedSkills)].filter(Boolean).join('\n\n'), onFrame: frame => {
       if (frame.type === 'start') noteSkillUse(appliedSkills);
       if (frame.type === 'done') serving.mark(entry.id, { tokensIn: frame.tokensIn, tokensOut: frame.tokensOut, usageSource: frame.usageSource });
       onFrame({ ...frame, requestId: entry.id, model: model.name, contextMax: model.contextMax, remoteModel: true, ...(frame.type === 'start' ? { skills: appliedSkills.map(s => s.name) } : {}) });
@@ -615,7 +631,7 @@ async function runAgentTurn({ res, controller, chatId, body, message, workspaceI
 }
 
 async function runTurn({ message, history = [], onFrame, signal, client, workspaceId = null, sessionId = null, remoteModel = null, runtimeModelId = undefined, nativeModelId, images=[], useTools=false, thinking='medium', thinkingBudget=0 }) {
-  if (remoteModel) return runRemoteTurn({ selection: remoteModel, message, history, images, onFrame, signal, workspaceId });
+  if (remoteModel) return runRemoteTurn({ selection: remoteModel, message, history, images, onFrame, signal, workspaceId, sessionId });
   if(native.hasLive()||nativeModelId){
     let instance;try{instance=native.resolveInstance(nativeModelId??native.state().defaultId);}catch(e){const message=plainNoModel(e.message);onFrame({type:'error',message});return {error:message};}const started=Date.now(),cancel=new AbortController();
     const entry=serving.open({client:client??'Strata chat',endpoint:'/chat/completions',model:instance.apiModelId,instanceId:instance.id,gpuIds:instance.gpus.map(String),cancel:()=>cancel.abort()});
@@ -1336,8 +1352,8 @@ async function api(req, res, path, method, url) {
 
   // --- models -------------------------------------------------------------
   if (path === '/api/local-models/browse' && method === 'GET') {
-    const shortcuts = [{name:'Model directory',path:store.MODELS_DIR},{name:'Home',path:process.env.USERPROFILE??process.env.HOME}].filter(s=>s.path);
-    try { return json(res, 200, { ...browseLocalModels(url.searchParams.get('directory') ?? store.MODELS_DIR), shortcuts }); }
+    const homeDir = process.env.USERPROFILE ?? process.env.HOME; const shortcuts = [{name:'Home',path:homeDir},{name:'Desktop',path:homeDir?join(homeDir,'Desktop'):null},{name:'Documents',path:homeDir?join(homeDir,'Documents'):null},{name:'D:\\',path:'D:\\'},{name:'C:\\',path:'C:\\'}].filter(s=>s.path&&existsSync(s.path));
+    try { return json(res, 200, { ...browseLocalModels(url.searchParams.get('directory') ?? homeDir ?? store.MODELS_DIR), shortcuts }); }
     catch (err) { return error(res, 400, err.message); }
   }
   if (path === '/api/local-models/inspect' && method === 'POST') {
@@ -1635,7 +1651,7 @@ async function api(req, res, path, method, url) {
     const root = (rootId ? workspaces.find((w) => w.id === rootId)?.path : null) ?? WORKSPACE;
     const target = resolve(root, rel);
     // A relative path may not escape its workspace.
-    if (target !== resolve(root) && !target.startsWith(resolve(root) + '/')) {
+    if (!isInside(root, target)) {
       return error(res, 400, 'That file is outside the workspace.');
     }
     let st;
