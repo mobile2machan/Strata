@@ -26,6 +26,8 @@ ACCESS_WORDS = {"local": "This computer only", "lan": "My local network", "cloud
 TUNE_MODES = ("quick", "thorough", "skip")
 VISION_MODES = ("off", "on", "gpu", "cpu")
 MTP_MODES = ("on", "off")
+#: strata_control/drafting.py MODES (tests/terminal/test_drafting.py keeps the two the same)
+DRAFTING_MODES = ("auto", "mtp", "dflash2", "off")
 KV_MODES = ("int8", "q4_0", "k8v4", "fp16")
 DEFAULT_PORT = 8080
 
@@ -82,10 +84,12 @@ class LaunchSettings:
     model_path: str | None = None              # "Use model files I already have": a .gguf file or a folder
     data_dir: str | None = None                # where model files are stored (None: the Strata default)
     gpus: list[int] | None = None              # None = the engine's choice (all usable cards)
+    gpu_roles: dict[str, str] | None = None    # {"1": "main", "0": "helper", "2": "off"}: a role for every card; None = the recommendation
     context: int | None = None
     kv: str | None = None                      # None = int8 above 8K, as setup
     vision: str | None = None                  # None = the default (on when the model can read pictures and the engine has the reader), off | on | gpu | cpu
     parallel: int | None = None                # None = fit to the card
+    drafting: str | None = None                # None = Auto (recommended): the table in strata_control/drafting.py; mtp | dflash2 | off choose one. Saved in the launch config
     mtp: str | None = None                     # None = as installed (draft layer on); "off" starts without it (less graphics memory and RAM, slower); "on" overrides an installed "off"
     tune: str = "skip"                         # quick | thorough | skip
     tune_allow_small: bool = False             # the "answer-changing" tick, off by default, as in the app
@@ -251,6 +255,8 @@ def as_argv_changes(extra: dict[str, str], bool_flags: frozenset[str]) -> tuple[
     for key, value in extra.items():
         if key.startswith("--"):
             low = value.lower()
+            if low == "" and key not in bool_flags:
+                continue                          # an empty value for an option that takes one is no change, never a bare flag (#3504)
             if key in bool_flags or low in ("on", "true", "yes", ""):
                 args[key] = None if low in ("off", "false", "no", "none") else True
             elif low in ("off", "false", "no", "none"):
@@ -284,12 +290,16 @@ def flags_text(s: LaunchSettings, *, preset: str | None = None) -> str:
             parts.append(f"--parallel {s.parallel}")
         if s.mtp:
             parts.append(f"--mtp {s.mtp}")
+        if s.drafting:
+            parts.append(f"--drafting {s.drafting}")
         parts.append(f"--tune {s.tune}")
         if s.tune_allow_small:
             parts.append("--tune-allow-small")
         parts.append(f"--access {s.access}")
         parts.append(f"--port {s.port}")
-        if s.gpus:
+        if s.gpu_roles:
+            parts.append("--gpu-roles " + ",".join(f"{k}={v}" for k, v in sorted(s.gpu_roles.items(), key=lambda kv: int(kv[0]))))
+        elif s.gpus:
             parts.append("--gpu " + ",".join(str(g) for g in s.gpus))
     for k, v in sorted(s.extra.items()):
         parts.append(f"--set {k[2:] if k.startswith('--') else k}={v}" if v else f"--set {k[2:] if k.startswith('--') else k}")

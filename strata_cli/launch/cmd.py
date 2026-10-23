@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -98,11 +99,21 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
     g.add_argument("--mtp", type=_choice("a draft layer setting", S.MTP_MODES), metavar="on|off",
                    help="the draft layer that makes answers faster. off starts without it: about 1 GB less graphics memory and less RAM, "
                         "slower answers; use it when the engine stops at start on a small card or a PC with little RAM. Default: on")
+    g.add_argument("--drafting", type=_choice("a drafting setting", S.DRAFTING_MODES), metavar="auto|mtp|dflash2|off",
+                   help="which drafter guesses words ahead to make answers faster: auto (recommended: Strata picks from what it measured on cards like yours; "
+                        "that is the MTP today), mtp, dflash2 (Qwen3.8-Flash-Next only; downloads a 1.2 GB drafter once) or off. If DFlash2 cannot run "
+                        "(not enough graphics memory, or a model it is not for) the MTP is used and the start says why")
     g.add_argument("--gpu", metavar="LIST", help="graphics card numbers to use, e.g. 0 or 0,1 (default: the engine's choice)")
+    g.add_argument("--gpu-roles", metavar="LIST", help="a role for each graphics card: main, helper or off, e.g. 1=main,0=helper (cards you do not name are off). "
+                   "Main does the last steps of every answer; a helper holds part of the model")
     g.add_argument("--tune", type=_choice("a tuning mode", S.TUNE_MODES), metavar="quick|thorough|skip", help="find the fastest settings first (default: skip here; the guided screens suggest quick the first time)")
     g.add_argument("--tune-allow-small", action="store_true", help="let the tuner also try settings that can change answers very slightly")
     g.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                    help="an advanced engine setting or STRATA_* variable, e.g. prefill=65536 (repeat); unknown names get a warning, not a refusal")
+    g.add_argument("--pool-cores", metavar="LIST",
+                   help="experimental: pin the CPU workers to exactly these logical processors, e.g. 2,4,6,8 or 2-14:2 (the numbers Task Manager or "
+                        "lscpu show). The default is one worker per physical core, which the engine's start line names; "
+                        "two entries on one core are kept with a warning")
     a = p.add_argument_group("who can use it")
     a.add_argument("--access", type=_choice("a way to share Strata", S.ACCESS_KINDS), metavar="local|lan|cloudflare|tailscale",
                    help="local: this computer only; lan: your network; cloudflare: a quick tunnel; tailscale: your tailnet")
@@ -116,6 +127,9 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
     o.add_argument("--retune", action="store_true",
                    help="with --tune (quick is used when --tune is not given): measure again even when this model was already tuned on this computer "
                         "(by default a stored tuning result is reused and no measuring is done)")
+    o.add_argument("--restart", action="store_true",
+                   help="when a model is already serving other choices (or holds the port), stop it and start these. Without it the screens ask once "
+                        "and --no-tui refuses; --yes alone never restarts. The same choices are never restarted: the running address is printed")
     o.add_argument("--no-tui", action="store_true", help="no screens: serve, print the address and return")
     o.add_argument("--open", action="store_true", help="open the server's web page in your browser once it is serving (nothing opens a browser without this)")
     o.add_argument("--yes", action="store_true", help="do not ask questions (for one: whether to download the model on a computer with no engine yet)")
@@ -198,6 +212,10 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
     elif a.family and s.model:
         s.family = a.family
     if a.data_dir:
+        from strata_control import folders
+        found = folders.problem(a.data_dir)
+        if found:
+            raise ValueError(folders.words(found))                  # one plain line and a next step, before anything is written (B05)
         s.data_dir = a.data_dir
     if a.context:
         s.context = a.context
@@ -209,8 +227,20 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
         s.parallel = a.parallel
     if a.mtp:
         s.mtp = a.mtp
+    if a.drafting:
+        s.drafting = a.drafting
+    if a.gpu and getattr(a, "gpu_roles", None):
+        raise ValueError("Use --gpu (which cards) or --gpu-roles (a role for each card), not both.")
     if a.gpu:
         s.gpus = _gpus(a.gpu)
+        s.gpu_roles = None
+    if getattr(a, "gpu_roles", None):
+        from strata_control import gpu_roles as GR
+        try:
+            s.gpu_roles = {str(k): v for k, v in GR.parse_roles(a.gpu_roles).items()}
+        except ValueError as e:
+            raise ValueError(f"--gpu-roles: {e}") from None
+        s.gpus = None
     if a.tune:
         s.tune = a.tune
     if a.tune_allow_small:
@@ -235,6 +265,13 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
         s.no_key = False
     if a.set:
         s.extra = {**s.extra, **S.settings_from_pairs(a.set)}
+    if a.pool_cores:
+        text = a.pool_cores.replace(" ", "")
+        if not re.fullmatch(r"\d+(-\d+(:\d+)?)?(,\d+(-\d+(:\d+)?)?)*", text):
+            notices.append(S.Notice("warn", f"'{a.pool_cores}' is not a list of logical processor numbers, so --pool-cores is left out.",
+                                    "Write it like 2,4,6,8 or 2-14:2. The CPU workers keep their default placement."))
+        else:
+            s.extra = {**s.extra, "--pool-cores": text}
     if a.save_preset:
         s.name = a.save_preset
     return s, notices
@@ -274,14 +311,37 @@ def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list
         notices += S.check_context(s, max_fit_tokens=None)
     if s.access != "local" and not s.api_key and not s.no_key:
         from strata_cli.launch import access
-        s.api_key = access.new_key()
-        notices.append(S.Notice("warn", "A new API key was made, because the server is shared beyond this computer.",
-                                "It is saved with the preset; show it with: strata launch --show-key"))
+        kept = access.kept_key(s.name or f"{s.model or 'model'} {S.context_label(s.context)}")
+        s.api_key = kept or access.new_key()
+        if kept:
+            notices.append(S.Notice("warn", "The API key from the earlier launch is kept, so apps that use it keep working.",
+                                    "A different one: add --new-key. Show it with: strata launch --show-key"))
+        else:
+            notices.append(S.Notice("warn", "A new API key was made, because the server is shared beyond this computer.",
+                                    "It is saved with the preset; show it with: strata launch --show-key"))
     notices += gpu_notices(s, comp)
     notices += S.check_access(s)
     vram = comp.main_vram_gb or None
     notices += S.check_parallel(s, vram_gb=vram)
     return s, notices
+
+
+def roles_line(s: S.LaunchSettings, catalog) -> str | None:
+    """`Main: GPU 2 RTX 4070 Ti. Helper: GPU 1 RTX 3060.` for the cards this launch names (--gpu-roles, or --gpu: the faster card goes last), else None."""
+    if not (s.gpu_roles or s.gpus) or catalog is None:
+        return None
+    try:
+        from strata_control import gpu_roles
+        comp = catalog.computer()
+        cards = gpu_roles.rows(comp.gpus, comp.engine_vendor)
+        if s.gpu_roles:
+            named = {int(k): v for k, v in s.gpu_roles.items()}
+            roles = gpu_roles.normalize({int(c.get("index", 0)): named.get(int(c.get("index", 0)), "off") for c in cards}, cards)
+        else:
+            roles = gpu_roles.from_legacy(list(s.gpus), cards)
+        return gpu_roles.describe(roles, cards)
+    except Exception:                                        # noqa: BLE001 - a summary line must never stop a launch
+        return None
 
 
 def gpu_notices(s: S.LaunchSettings, comp) -> list[S.Notice]:
@@ -304,9 +364,21 @@ def gpu_notices(s: S.LaunchSettings, comp) -> list[S.Notice]:
                                     f"A model cannot be split across {make} and {omake} cards. {gpu_fit.SECOND_MODEL_SENTENCE}",
                                     f"Name a {make} card (" + ", ".join(str(g.get("index")) for g in comp.usable_gpus) + f"), or install the {omake} "
                                     "build of Strata to use that card."))
+    if s.gpu_roles and vendor:
+        from strata_control import gpu_roles
+        have = {int(c.get("index", -1)): c for c in gpu_roles.rows(comp.gpus, vendor)}
+        for k in s.gpu_roles:
+            if int(k) not in have:
+                out.append(S.Notice("error", f"There is no card {k} that this build of Strata can use.",
+                                    "Cards: " + (", ".join(str(i) for i in sorted(have)) or "none") + "."))
+        if not any(r != "off" for r in s.gpu_roles.values()) and not out:
+            out.append(S.Notice("warn", gpu_roles.NO_CARD_LINE, ""))
     note = comp.other_vendor_note
     if note:
         out.append(S.Notice("warn", note, ""))
+    new_card = comp.new_card_note
+    if new_card:
+        out.append(S.Notice("warn", new_card[0], new_card[1]))
     return out
 
 
@@ -315,6 +387,17 @@ def gpu_notices(s: S.LaunchSettings, comp) -> list[S.Notice]:
 def _say(line: str = "") -> None:
     sys.stdout.write(line + "\n")
     sys.stdout.flush()
+
+
+def _interrupted_move_notice() -> None:
+    """One line when a move of the models folder was left unfinished (never blocks the launch)."""
+    try:
+        from strata_control import discovery, models_move
+        st = models_move.interrupted(discovery.data_dir(Path.home() / "Strata")[0])
+    except Exception:
+        return
+    if st:
+        _say("A move of your models was interrupted. Finish it with `strata models move --resume`, or keep them where they are with `strata models move --leave`.")
 
 
 def _printer(quiet: bool = False):
@@ -403,7 +486,15 @@ def _move_data_choice(a: argparse.Namespace, s: S.LaunchSettings, catalog, machi
         gb = library.movable_library(catalog.data_dir(), Path(a.data_dir).expanduser())
     except Exception:                                        # noqa: BLE001 - no answer to "where are my models": nothing to ask about
         return False
-    return library.ask_move(gb, Path(a.data_dir).expanduser()) if gb > 0 else False
+    if gb <= 0:
+        return False
+    new = Path(a.data_dir).expanduser()
+    if getattr(a, "no_tui", False) or not sys.stdin.isatty():
+        # --no-tui and a run without a keyboard never ask (round 8, M): the default that loses nothing, said out loud
+        size = f"{gb:.0f} GB" if gb >= 10 else f"{gb:.1f} GB"
+        _say(f"Keeping your {size} of models where they are; {new} is used for new downloads. (--move-data moves them instead.)")
+        return False
+    return library.ask_move(gb, new)
 
 
 def open_page(url: str) -> bool:
@@ -547,12 +638,14 @@ def run_launch(a: argparse.Namespace) -> int:
             if a.model or a.model_path:
                 return fail(str(e), 5)
         s, notices = settings_from_args(a, catalog)
-        have_choices = bool(a.preset or a.model or a.model_path or a.context or a.vision or a.parallel or a.access or a.tune)
+        if not machine:
+            _interrupted_move_notice()
+        have_choices = bool(a.preset or a.model or a.model_path or a.context or a.vision or a.parallel or a.access or a.tune or a.drafting)
         interactive = sys.stdin.isatty() and sys.stdout.isatty() and not a.no_tui and not machine and not a.plan
         plain_questions = False
         if not have_choices and not interactive and not a.plan:
-            if machine or catalog is None or not _can_ask():
-                return fail("`strata launch` with no choices opens screens, and this is not a terminal. Name what to start: --preset NAME, or --model NAME "
+            if machine or a.no_tui or catalog is None or not _can_ask():     # --no-tui never asks (round 8, M)
+                return fail("`strata launch` with no choices opens screens, and this is not a terminal (or --no-tui was given). Name what to start: --preset NAME, or --model NAME "
                             "(strata launch --help has examples; --plan shows what would happen without changing anything).", 2)
             # Git Bash, mintty and some editor panels cannot show the screens although a person is typing: go on in plain lines, and ask first
             plain_questions = True
@@ -562,18 +655,19 @@ def run_launch(a: argparse.Namespace) -> int:
             if catalog is None:
                 return fail("This Terminal does not carry the model list, so the screens cannot open. Install it again with the one-line installer.", 5)
             from strata_cli.launch import app
-            return _tui(app.run_tui, None, catalog=catalog, feed=a.feed, open_page=bool(a.open))
+            return _tui(app.run_tui, None, catalog=catalog, feed=a.feed, open_page=bool(a.open), restart=bool(getattr(a, "restart", False)))
         if catalog is None:
             return fail("This Terminal does not carry the model list. Install it again with the one-line installer.", 5)
         if getattr(a, "retune", False) and s.tune == "skip":
             s.tune = "quick"
         runner = Runner(s, catalog=catalog, emit=_printer(machine), feed=a.feed, assume_yes=bool(a.yes or machine), confirm=_ask_yes,
-                        retune=bool(getattr(a, "retune", False)))
+                        retune=bool(getattr(a, "retune", False)), restart=bool(getattr(a, "restart", False)))
         try:
             runner.check_own_files()                         # the person's own files: a wrong path is said now, and the files name the model
         except LaunchError as e:
             return fail(f"{e.text}" + (f" {e.next}" if e.next else ""), e.code)
         s, notes = apply_defaults(s, catalog)
+        notes = [*notices, *notes]                           # what the flags themselves said (a --pool-cores list that could not be read, a key beside --no-api-key)
         errors = [n for n in notes if n.level == "error"]
         if errors:
             return fail(errors[0].line(), 2)
@@ -599,16 +693,25 @@ def run_launch(a: argparse.Namespace) -> int:
                     _say(f"  model     {m.get('title') or f'{s.family} {s.model}'}{size}")
                 _say(f"  context   {S.context_label(s.context)}    pictures {PICTURE_WORDS.get(s.vision or 'off', s.vision)}    parallel {s.parallel or 'fit to your card'}")
                 _say(f"  download  {(plan.get('download') or {}).get('text', '')}")
+                if plan.get("drafting"):
+                    _say(f"  drafting  {plan['drafting'].replace('Drafting: ', '', 1)}")
                 _say(f"  tuning    {s.tune}    access {S.ACCESS_WORDS[s.access]}, port {s.port}"
                      + ("    API key on" if s.api_key else ""))
                 for n in notes:
                     _say(f"  [!] {n.line()}")
+                line = roles_line(s, catalog)
+                if line:
+                    _say(f"  cards     {line}")
                 _say(f"  same as   {S.flags_text(s)}")
                 _say("Nothing was changed.")
             return 0
         for n in notes:
             if not machine:
                 _say(f"[!] {n.line()}")
+        if not machine:
+            line = roles_line(s, catalog)
+            if line:
+                _say(line)
         from strata_cli.launch import access as _access
         fw = _access.firewall_note(s.access)
         if fw and not machine:
@@ -624,7 +727,7 @@ def run_launch(a: argparse.Namespace) -> int:
         if interactive and have_choices:
             from strata_cli.launch import app
             return _tui(app.run_tui, s, catalog=catalog, feed=a.feed, auto_run=True, save=bool(a.save_preset), open_page=bool(a.open),
-                         move_data=move_data, retune=bool(getattr(a, "retune", False)))
+                         move_data=move_data, retune=bool(getattr(a, "retune", False)), restart=bool(getattr(a, "restart", False)))
         try:
             result = runner.run()
         except LaunchError as e:
@@ -643,12 +746,12 @@ def run_launch(a: argparse.Namespace) -> int:
                 _say(result.final_text)
             return 0
         if machine:
-            print(json.dumps({"schema_version": 1, "ok": True, "name": s.name, "profile": result.profile, "urls": result.urls,
+            print(json.dumps({"schema_version": 1, "ok": True, "name": s.name, "profile": result.profile, "urls": result.urls, "reused": result.reused,
                               "api_key": "set" if result.key else None, "tuned": result.tune_word,
                               "notices": result.notices + [n.line() for n in notes]}))
             return 0
         _say("")
-        _say("Strata is serving.")
+        _say("Already serving these choices; nothing was restarted." if result.reused else "Strata is serving.")
         for u in result.urls:
             label = ("This computer" if "127.0.0.1" in u else "Cloudflare" if "trycloudflare" in u else
                      "Tailscale" if ("ts.net" in u or u.split("//")[1].startswith("100.")) else "Network")

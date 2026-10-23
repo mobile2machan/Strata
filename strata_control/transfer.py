@@ -15,6 +15,7 @@ import hashlib
 import http.client
 import ipaddress
 import os
+import re
 import threading
 import email.utils
 import datetime as _dt
@@ -23,6 +24,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Callable
+
+from strata_control import tls
+
+tls.install()      # #3722: the operating system's certificates, like the browser
 
 CHUNK = 1 << 20
 SMALL_LIMIT = 8 << 20
@@ -174,9 +179,8 @@ def read_small(location: str, *, limit: int = SMALL_LIMIT, timeout: float = 30) 
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         reason = getattr(exc, "reason", exc)
         hint = ""
-        if "CERTIFICATE_VERIFY_FAILED" in str(reason):
-            hint = (". This computer did not accept the update server's certificate: check that its date and time are right, "
-                    "or that a company proxy is not replacing the certificate")
+        if tls.is_certificate_error(exc):
+            raise TransferError(tls.explain(tls.host_of(location))) from None
         raise TransferError(f"could not read {location} ({type(exc).__name__}: {reason}){hint}") from None
     if len(data) > limit:
         raise TransferError(f"{location} is larger than {limit} bytes")
@@ -228,8 +232,11 @@ def _transfer(location, partial: Path, have: int, size: int, progress, cancel, t
                 headers["Range"] = f"bytes={have}-"
             request = urllib.request.Request(location, headers=headers)
             with _opener.open(request, timeout=timeout) as response:
-                if have and response.status != 206:
-                    have = done = 0                          # the server ignored the range: start over, never append to a prefix
+                if have and not _resumes_at(response, have, size):
+                    if response.status == 206:               # another range: its bytes are not the file's, ask again from the start
+                        partial.unlink(missing_ok=True)
+                        return _transfer(location, partial, 0, size, progress, cancel, timeout)
+                    have = done = 0                          # the server ignored the range and sent the whole file: start over, never append to a prefix
                 _copy(response, partial, "wb" if not have else "ab", done, size, progress, cancel)
         else:
             path = _local_path(location)
@@ -245,11 +252,24 @@ def _transfer(location, partial: Path, have: int, size: int, progress, cancel, t
                                 resumable=False) from None
         raise TransferError(f"the update server answered {exc.code} for {location}") from None
     except (urllib.error.URLError, OSError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
+        if tls.is_certificate_error(exc):
+            raise TransferError(tls.explain(tls.host_of(location)), resumable=True) from None
         got = partial.stat().st_size if partial.exists() else 0
         reason = getattr(exc, "reason", exc)
         raise TransferError(f"the download of {location} was interrupted after {got} of {size} bytes "
                             f"({type(exc).__name__}: {reason}); the partial file is kept and the next try resumes it",
                             resumable=True) from None
+
+
+_CONTENT_RANGE = re.compile(r"\s*bytes (\d+)-(\d+)/(\d+|\*)\s*$")
+
+
+def _resumes_at(response, have: int, size: int) -> bool:
+    """Whether a resumed answer is a 206 whose Content-Range starts at byte `have` of a file of `size` bytes."""
+    if response.status != 206:
+        return False
+    m = _CONTENT_RANGE.match(response.headers.get("Content-Range") or "")
+    return bool(m) and int(m.group(1)) == have and (m.group(3) == "*" or int(m.group(3)) == size)
 
 
 def _copy(source, partial: Path, mode: str, done: int, size: int, progress, cancel) -> None:
