@@ -36,7 +36,11 @@ MODELS = {
             "STRATA_SPLIT_OWN": "1",
             "STRATA_GR_DOWN_MAX4": "1",
             "STRATA_PF_FUSED": "1",
-            "STRATA_NAN_GUARD": "1"
+            "STRATA_NAN_GUARD": "1",
+            "STRATA_SM120_PERF": "1",
+            "STRATA_SM86_PERF": "1",
+            "STRATA_GU_SWIGLU": "1",
+            "STRATA_MMVQ_IL_WIDE": "1",
         }
     },
     "qwen3.8-flash-next-iq3_s-dual-gpu": {
@@ -47,7 +51,11 @@ MODELS = {
             "STRATA_SPLIT_OWN": "1",
             "STRATA_GR_DOWN_MAX4": "1",
             "STRATA_PF_FUSED": "1",
-            "STRATA_NAN_GUARD": "1"
+            "STRATA_NAN_GUARD": "1",
+            "STRATA_SM120_PERF": "1",
+            "STRATA_SM86_PERF": "1",
+            "STRATA_GU_SWIGLU": "1",
+            "STRATA_MMVQ_IL_WIDE": "1",
         }
     }
 }
