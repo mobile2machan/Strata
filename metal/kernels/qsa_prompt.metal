@@ -64,8 +64,11 @@ kernel void qsa_attn_mm(device const half* qh [[buffer(0)]], device const char* 
                 for (uint16_t i = 0; i < rk.get_capacity(); ++i) {
                     const auto ix = rk.get_multidimensional_index(i);
                     const int k = k0 + ix[0], id = cid[ix[1]];
-                    const uint row = uint(id) * QKV + g;
-                    rk[i] = id >= 0 ? half(float(kq[row * QD + k]) * float(ksc[row * 4 + (k >> 6)])) : half(0.0f);
+                    // the row is clamped and the select is on the value: a select with the device load in the arm
+                    // loses the threadgroup on the M1 (macOS 26, measured); the discarded value cannot matter
+                    const uint row = uint(max(id, 0)) * QKV + g;
+                    const float v = float(kq[row * QD + k]) * float(ksc[row * 4 + (k >> 6)]);
+                    rk[i] = id >= 0 ? half(v) : half(0.0f);
                 }
             } else
 #pragma clang loop unroll(full)
@@ -120,7 +123,9 @@ kernel void qsa_attn_mm(device const half* qh [[buffer(0)]], device const char* 
                 for (uint16_t i = 0; i < rv.get_capacity(); ++i) {
                     const auto ix = rv.get_multidimensional_index(i);   // (cell, dim)
                     const int c = c0 + ix[0], d = d0 + ix[1], id = cid[c];
-                    rv[i] = id >= 0 ? half(float(vq[(uint(id) * QKV + g) * QD + d]) * float(vs[c][d >> 6])) : half(0.0f);
+                    const uint row = uint(max(id, 0)) * QKV + g;   // clamped, as in the S fill above
+                    const float v = float(vq[row * QD + d]) * float(vs[c][d >> 6]);
+                    rv[i] = id >= 0 ? half(v) : half(0.0f);
                 }
                 tPh = tP.template slice<32, 16>(c0, 0);
                 op.run(tPh, rv, acc);
@@ -146,6 +151,32 @@ kernel void qsa_attn_mm(device const half* qh [[buffer(0)]], device const char* 
 kernel void qsa_q_f16(device const float* q [[buffer(0)]], device half* qh [[buffer(1)]], constant uint& n [[buffer(2)]],
                       uint gid [[thread_position_in_grid]]) {
     if (gid < n) qh[gid] = half(q[gid]);
+}
+
+// qsa_merge for a prompt chunk with the fp16 output the attn_output GEMM reads: qsa_merge's y, as half, at [t][h][d]
+// (qsa_merge writes y into the first plane of the prepared activations and act_f16 rounds that plane to half; here one
+// pass, bitwise the same halves, and no other plane or sum).  grid (QH, n_tok), 256 threads.
+kernel void qsa_merge_h(device const float* part [[buffer(0)]], device const float* qfull [[buffer(1)]],
+                        device half* xh [[buffer(2)]], constant QsaArgs& a [[buffer(3)]],
+                        uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    const int h = int(tg.x), t = int(tg.y);
+    const int nchunks = (QBUDGET + QCH - 1) / QCH;
+    const uint n_kv = a.pos0 + uint(t) + 1, width = min(n_kv, uint(QBUDGET));
+    const int nc = int((width + QCH - 1) / QCH);
+    device const float* pp = part + (uint(t) * nchunks * QH + uint(h)) * (QD + 2);
+    float M = -INFINITY;
+    for (int k = 0; k < nc; ++k) M = max(M, pp[k * QH * (QD + 2) + QD]);
+    float L = 0.0f, o = 0.0f;
+    for (int k = 0; k < nc; ++k) {
+        device const float* q = pp + k * QH * (QD + 2);
+        const float e = exp(q[QD] - M);
+        L = fma(q[QD + 1], e, L);
+        o = fma(q[tid], e, o);
+    }
+    o = o / L;
+    const float gate = qfull[(t * QH + h) * 2 * QD + QD + tid];
+    const float y = o * (1.0f / (1.0f + exp(-gate)));
+    xh[(uint(t) * QH + uint(h)) * QD + tid] = half(y);
 }
 
 // qsa_score as a GEMM (fp32 operands, so the selection sees qsa_score's values to fp32 rounding): S[(t, h)][b] =
@@ -262,8 +293,9 @@ kernel void qsa_flash(device const half* qh [[buffer(0)]], device const char* kq
                     for (uint16_t i = 0; i < rk.get_capacity(); ++i) {
                         const auto ix = rk.get_multidimensional_index(i);
                         const int k = k0 + ix[0], id = cid[ix[1]];
-                        const uint row = uint(id) * QKV + g;
-                        rk[i] = id >= 0 ? half(float(kq[row * QD + k]) * float(ksc[row * 4 + (k >> 6)])) : half(0.0f);
+                        const uint row = uint(max(id, 0)) * QKV + g;   // clamped, as in qsa_attn_mm
+                        const float v = float(kq[row * QD + k]) * float(ksc[row * 4 + (k >> 6)]);
+                        rk[i] = id >= 0 ? half(v) : half(0.0f);
                     }
                 } else
 #pragma clang loop unroll(full)
@@ -318,7 +350,9 @@ kernel void qsa_flash(device const half* qh [[buffer(0)]], device const char* kq
             for (uint16_t i = 0; i < rv.get_capacity(); ++i) {
                 const auto ix = rv.get_multidimensional_index(i);   // (cell, dim)
                 const int c = c0 + ix[0], d = d0 + ix[1], id = cid[c];
-                rv[i] = id >= 0 ? half(float(vq[(uint(id) * QKV + g) * QD + d]) * float(vsc[(uint(id) * QKV + g) * 4 + sg])) : half(0.0f);
+                const uint row = uint(max(id, 0)) * QKV + g;   // clamped, as in qsa_attn_mm
+                const float v = float(vq[row * QD + d]) * float(vsc[row * 4 + sg]);
+                rv[i] = id >= 0 ? half(v) : half(0.0f);
             }
             tPh = tP.template slice<32, 16>(c0, 0);
             opO.run(tPh, rv, acc);
